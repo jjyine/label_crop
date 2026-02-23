@@ -1,0 +1,30 @@
+# 가상환경
+.venv/
+venv/
+
+# vscode
+.vscode/
+
+# python cache
+__pycache__/
+*.pyc
+
+# model files
+*.pt
+*.weights
+*.cfg
+
+# images
+*.png
+*.jpg
+*.jpeg
+
+# output folders
+runs/
+outputs/
+
+# debug files
+debug_*.png
+
+# mac
+.DS_Store
