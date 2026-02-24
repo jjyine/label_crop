@@ -96,105 +96,137 @@ def encode_bgr_to_data_url_png(bgr: np.ndarray) -> str:
 
 
 # -----------------------------
+# 하이라이트(반사) 제거: Specular Glare Reduction
+# -----------------------------
+def reduce_specular_glare(bgr: np.ndarray) -> np.ndarray:
+    """
+    밝고(V↑) 채도 낮은(S↓) 하이라이트 영역을 마스크로 잡아 inpaint로 메운다.
+    목적: 반사/조명으로 생기는 강한 edge를 줄여 OpenAI bbox + SAM 마스크 안정화.
+    """
+    hsv = cv2.cvtColor(bgr, cv2.COLOR_BGR2HSV)
+
+    # 하이라이트 후보: 밝고(V↑) 채도 낮음(S↓)
+    glare = cv2.inRange(hsv, (0, 0, 210), (180, 60, 255))
+
+    # 조금 부드럽게 확장/정리
+    k = np.ones((5, 5), np.uint8)
+    glare = cv2.morphologyEx(glare, cv2.MORPH_OPEN, k, iterations=1)
+    glare = cv2.dilate(glare, k, iterations=1)
+
+    # inpaint로 하이라이트 제거
+    out = cv2.inpaint(bgr, glare, 3, cv2.INPAINT_TELEA)
+    return out
+
+
+# -----------------------------
+# ✅ SAM 멀티마스크 중 "라벨다운" 마스크 선택을 위한 스코어링
+# -----------------------------
+def score_label_mask(mask: np.ndarray, w: int, h: int) -> float:
+    """
+    mask가 라벨(종이 시트)처럼 보일수록 높은 점수를 준다.
+    - fill: bbox를 얼마나 꽉 채우는지 (로고만 잡으면 fill 낮음)
+    - center: 이미지 중심에 가까운지
+    - ar_pen: 비율이 너무 극단적이면 감점
+    """
+    ys, xs = np.where(mask > 0)
+    if len(xs) == 0:
+        return -1e9
+
+    x1, x2 = int(xs.min()), int(xs.max())
+    y1, y2 = int(ys.min()), int(ys.max())
+    bw, bh = (x2 - x1 + 1), (y2 - y1 + 1)
+
+    area = float(mask.sum())
+    bbox_area = float(bw * bh) + 1e-6
+    fill = area / bbox_area
+
+    ar = bw / float(bh + 1e-6)
+    ar_pen = 1.0 if (0.35 <= ar <= 3.2) else 0.5
+
+    cx, cy = (x1 + x2) / 2.0, (y1 + y2) / 2.0
+    dist = ((cx - w / 2.0) ** 2 + (cy - h / 2.0) ** 2) ** 0.5
+    center = 1.0 - min(1.0, dist / (0.75 * (w * h) ** 0.5))
+
+    return (2.2 * fill + 0.6 * center) * ar_pen
+
+
+# -----------------------------
 # Edge assist image 생성
 # -----------------------------
 def create_edge_assist_image(bgr: np.ndarray):
     """
-    원본 컬러를 유지하지 않고,
     Gray 기반 + edge를 흰색으로 강조한 '보조 이미지' 생성.
+    ✅ glare 제거를 먼저 적용해서(반사/조명 edge 감소) assist/edges가 라벨 윤곽에 더 집중하도록 한다.
     """
-    gray = cv2.cvtColor(bgr, cv2.COLOR_BGR2GRAY)
+    bgr_no_glare = reduce_specular_glare(bgr)
 
-    # 대비 강화
+    gray = cv2.cvtColor(bgr_no_glare, cv2.COLOR_BGR2GRAY)
+
     clahe = cv2.createCLAHE(clipLimit=2.0, tileGridSize=(8, 8))
     enhanced = clahe.apply(gray)
 
-    # edge
     edges = cv2.Canny(enhanced, 40, 140)
     kernel = np.ones((3, 3), np.uint8)
     edges = cv2.dilate(edges, kernel, iterations=1)
 
-    # gray -> 3채널로 만들고, edge 위치를 흰색으로 표시
     assist = cv2.cvtColor(gray, cv2.COLOR_GRAY2BGR)
     assist[edges > 0] = (255, 255, 255)
 
     return assist, edges, enhanced
 
 
-def find_label_roi_from_edges(
-    edges: np.ndarray,
-    image_shape,
-    debug: bool = False
-):
-    """
-    edges(0/255)에서 라벨 후보 ROI bbox를 찾는다.
-    반환: (x1,y1,x2,y2) or None, info dict
-    """
+def find_label_roi_from_edges(edges: np.ndarray, image_shape, debug: bool = False):
     h, w = image_shape[:2]
 
-    # edges는 0/255 또는 0/1일 수 있으니 0/255로 정규화
     e = edges.copy()
     if e.dtype != np.uint8:
         e = e.astype(np.uint8)
     if e.max() == 1:
         e = (e * 255).astype(np.uint8)
 
-    # 노이즈 줄이기: close로 끊긴 선을 좀 잇고, dilate로 덩어리화
     kernel = np.ones((5, 5), np.uint8)
     e2 = cv2.morphologyEx(e, cv2.MORPH_CLOSE, kernel, iterations=1)
     e2 = cv2.dilate(e2, kernel, iterations=1)
 
-    # contour 추출
     contours, _ = cv2.findContours(e2, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
-
     if not contours:
         return None, {"reason": "no_contours"}
 
-    # 후보 필터링 + 스코어링
     candidates = []
     img_area = float(w * h)
 
-    # 라벨은 보통 병 몸통 중앙 근처에 있고, 너무 작지 않으며, 가로세로 비율이 극단적이지 않음
     for cnt in contours:
         x, y, cw, ch = cv2.boundingRect(cnt)
         area = float(cw * ch)
-        if area < img_area * 0.02:   # 너무 작은 것 제거 (2% 미만)
+        if area < img_area * 0.02:
             continue
-        if area > img_area * 0.65:   # 너무 큰 것 제거 (병 전체/배경일 가능성)
+        if area > img_area * 0.65:
             continue
 
         ar = cw / float(ch + 1e-6)
-
-        # 라벨 비율 가드 (상황 따라 조절)
-        # 와인 라벨은 대체로 0.5~2.5 사이에 많이 있음 (세로형/가로형 모두)
         if ar < 0.35 or ar > 3.2:
             continue
 
-        # 중앙성 점수: 라벨은 보통 중앙에 가까움
         cx = x + cw / 2.0
         cy = y + ch / 2.0
-        dist = ((cx - w/2.0)**2 + (cy - h/2.0)**2) ** 0.5
-        center_score = 1.0 - min(1.0, dist / (0.75 * (w**2 + h**2) ** 0.5))
+        dist = ((cx - w / 2.0) ** 2 + (cy - h / 2.0) ** 2) ** 0.5
+        center_score = 1.0 - min(1.0, dist / (0.75 * (w ** 2 + h ** 2) ** 0.5))
 
-        # contour가 얼마나 "사각형에 가까운지": contour area / bbox area
         cnt_area = float(cv2.contourArea(cnt))
-        rect_fill = cnt_area / (area + 1e-6)  # 1에 가까울수록 꽉 참
+        rect_fill = cnt_area / (area + 1e-6)
 
-        # 최종 점수(가중치): 면적 + 중앙성 + 사각형성
-        area_score = min(1.0, area / (img_area * 0.25))  # 25% 정도면 만점
+        area_score = min(1.0, area / (img_area * 0.25))
         score = 0.45 * area_score + 0.35 * center_score + 0.20 * rect_fill
 
-        candidates.append(((x, y, x+cw, y+ch), score, {"ar": ar, "rect_fill": rect_fill, "area": area}))
+        candidates.append(((x, y, x + cw, y + ch), score, {"ar": ar, "rect_fill": rect_fill, "area": area}))
 
     if not candidates:
         return None, {"reason": "no_candidates_after_filter"}
 
-    # 점수 최고 후보 선택
     candidates.sort(key=lambda t: t[1], reverse=True)
     best_bbox, best_score, meta = candidates[0]
 
-    # ROI는 조금 여유롭게 확장 (라벨 경계 누락 방지)
-    pad = int(min(w, h) * 0.06)  # 6% 정도 (원하면 0.03~0.10 조절)
+    pad = int(min(w, h) * 0.06)
     x1, y1, x2, y2 = clamp_bbox(*best_bbox, w, h, pad=pad)
 
     info = {
@@ -205,8 +237,8 @@ def find_label_roi_from_edges(
         "padded_bbox": (x1, y1, x2, y2),
         "num_candidates": len(candidates),
     }
-
     return (x1, y1, x2, y2), info
+
 
 def offset_bbox(bbox, dx, dy):
     if bbox is None:
@@ -267,7 +299,6 @@ Image size: width={w}, height={h}
         }],
     )
 
-    # output_text 우선, 없으면 방어적으로 추출
     text = getattr(resp, "output_text", None)
     if not text:
         parts = []
@@ -284,12 +315,15 @@ Image size: width={w}, height={h}
     if not isinstance(bboxes, list) or len(bboxes) == 0:
         return None, {"reason": "openai_no_bbox", "response": text, "parsed": data}
 
-    # 여러개면 가장 큰 면적 선택
     cand = []
     for b in bboxes:
         if not all(k in b for k in ("x1", "y1", "x2", "y2")):
             continue
-        x1, y1, x2, y2 = clamp_bbox(b["x1"], b["y1"], b["x2"], b["y2"], w, h, pad=int(min(w, h) * 0.01))
+        x1, y1, x2, y2 = clamp_bbox(
+            b["x1"], b["y1"], b["x2"], b["y2"],
+            w, h,
+            pad=int(min(w, h) * 0.01)
+        )
         cand.append((x1, y1, x2, y2))
 
     if not cand:
@@ -315,10 +349,8 @@ def get_sam_predictor():
     if not _sam_available:
         return None
 
-    # 체크포인트 경로: 상대경로면 프로젝트 루트 기준으로도 한번 확인
     ckpt = SAM_CHECKPOINT
     if not os.path.isabs(ckpt):
-        # 프로젝트 루트 기준
         ckpt_candidate = os.path.join(BASE_DIR, ckpt)
         if os.path.exists(ckpt_candidate):
             ckpt = ckpt_candidate
@@ -340,7 +372,10 @@ def refine_bbox_with_sam(bgr: np.ndarray, init_bbox):
 
     h, w = bgr.shape[:2]
 
-    rgb = cv2.cvtColor(bgr, cv2.COLOR_BGR2RGB)
+    # SAM에도 glare 제거 이미지를 쓰면 반사로 인한 오인식이 줄어듦
+    bgr_no_glare = reduce_specular_glare(bgr)
+
+    rgb = cv2.cvtColor(bgr_no_glare, cv2.COLOR_BGR2RGB)
     predictor.set_image(rgb)
 
     x1, y1, x2, y2 = init_bbox
@@ -351,12 +386,30 @@ def refine_bbox_with_sam(bgr: np.ndarray, init_bbox):
         multimask_output=True
     )
 
-    best_idx = int(np.argmax(scores))
+    # ✅ 개선: score + "라벨다운 형태" 점수로 best mask 선택
+    best_idx = None
+    best_val = -1e9
+    for i in range(masks.shape[0]):
+        m = masks[i].astype(np.uint8)
+        val = float(scores[i]) + 0.8 * score_label_mask(m, w, h)
+        if val > best_val:
+            best_val = val
+            best_idx = i
+
+    if best_idx is None:
+        return None, {"reason": "sam_no_valid_mask", "scores": scores.tolist()}
+
     mask = masks[best_idx].astype(np.uint8)
 
     ys, xs = np.where(mask > 0)
     if len(xs) == 0 or len(ys) == 0:
-        return None, {"reason": "sam_empty_mask", "scores": scores.tolist(), "mask": mask}
+        return None, {
+            "reason": "sam_empty_mask",
+            "scores": scores.tolist(),
+            "best_idx": int(best_idx),
+            "best_val": float(best_val),
+            "mask": mask
+        }
 
     rx1, rx2 = int(xs.min()), int(xs.max())
     ry1, ry2 = int(ys.min()), int(ys.max())
@@ -364,9 +417,12 @@ def refine_bbox_with_sam(bgr: np.ndarray, init_bbox):
     rx1, ry1, rx2, ry2 = clamp_bbox(rx1, ry1, rx2, ry2, w, h, pad=int(min(w, h) * 0.005))
     refined_bbox = (rx1, ry1, rx2, ry2)
 
-    return refined_bbox, {"scores": scores.tolist(), "mask": mask}
-
-
+    return refined_bbox, {
+        "scores": scores.tolist(),
+        "best_idx": int(best_idx),
+        "best_val": float(best_val),
+        "mask": mask
+    }
 
 
 # -----------------------------
@@ -388,11 +444,14 @@ def save_debug_bundle(index: int,
     prefix = f"{index:03d}_{base}"
 
     cv2.imwrite(os.path.join(DEBUG_DIR, f"{prefix}_orig.png"), bgr)
+
+    bgr_no_glare = reduce_specular_glare(bgr)
+    cv2.imwrite(os.path.join(DEBUG_DIR, f"{prefix}_no_glare.png"), bgr_no_glare)
+
     cv2.imwrite(os.path.join(DEBUG_DIR, f"{prefix}_assist.png"), assist)
     cv2.imwrite(os.path.join(DEBUG_DIR, f"{prefix}_enhanced_gray.png"), enhanced_gray)
     cv2.imwrite(os.path.join(DEBUG_DIR, f"{prefix}_edges.png"), edges)
 
-    # overlay: openai bbox(노랑), sam refined(초록)
     overlay = bgr.copy()
 
     if openai_bbox is not None:
@@ -409,18 +468,14 @@ def save_debug_bundle(index: int,
 
     cv2.imwrite(os.path.join(DEBUG_DIR, f"{prefix}_overlay.png"), overlay)
 
-    # SAM mask 저장
     if sam_mask is not None:
         cv2.imwrite(os.path.join(DEBUG_DIR, f"{prefix}_sam_mask.png"), (sam_mask * 255).astype(np.uint8))
 
-        # mask overlay도 추가 저장
         mask_overlay = bgr.copy()
         m = sam_mask.astype(bool)
-        # 마스크 영역 약간 밝게 표시
         mask_overlay[m] = cv2.addWeighted(mask_overlay[m], 0.3, np.full_like(mask_overlay[m], 255), 0.7, 0)
         cv2.imwrite(os.path.join(DEBUG_DIR, f"{prefix}_sam_overlay.png"), mask_overlay)
 
-    # OpenAI 응답 원문 저장
     if openai_text:
         with open(os.path.join(DEBUG_DIR, f"{prefix}_openai_response.txt"), "w", encoding="utf-8") as f:
             f.write(openai_text)
@@ -445,35 +500,34 @@ def crop_labels(image: np.ndarray, data_url: str, index: int, debug: bool = True
         print("[DEBUG] OpenAI:", "ON" if _openai_client else "OFF")
         print("[DEBUG] SAM:", "ON" if (USE_SAM and _sam_available) else "OFF (or not installed)")
 
-    # 1) assist 이미지 생성
-    assist, edges, enhanced_gray = create_edge_assist_image(image)
+    # 전체 파이프라인 입력에서 glare 제거를 한 번 적용 (원본은 유지)
+    image_no_glare = reduce_specular_glare(image)
 
-    # ✅ 2) edge 기반 ROI 찾기
-    roi_bbox, roi_info = find_label_roi_from_edges(edges, image.shape, debug=debug)
+    # assist 이미지 생성
+    assist, edges, enhanced_gray = create_edge_assist_image(image_no_glare)
 
-    # ROI를 못 찾으면 기존 방식(전체 이미지로 OpenAI) fallback
+    # edge 기반 ROI 찾기
+    roi_bbox, roi_info = find_label_roi_from_edges(edges, image_no_glare.shape, debug=debug)
+
     if roi_bbox is None:
-        openai_bbox, info = detect_bbox_with_openai(image, assist, data_url)
+        openai_bbox, info = detect_bbox_with_openai(image_no_glare, assist, data_url)
         openai_text = info.get("response") if isinstance(info, dict) else None
         roi_used = False
         roi_offset = (0, 0)
     else:
         rx1, ry1, rx2, ry2 = roi_bbox
-        roi_color = image[ry1:ry2, rx1:rx2].copy()
+        roi_color = image_no_glare[ry1:ry2, rx1:rx2].copy()
         roi_assist = assist[ry1:ry2, rx1:rx2].copy()
 
-        # ✅ OpenAI는 ROI 안에서만 bbox 찾기
         openai_bbox_roi, info = detect_bbox_with_openai(roi_color, roi_assist, data_url)
         openai_text = info.get("response") if isinstance(info, dict) else None
 
-        # ROI 좌표계를 원본 좌표계로 복원
         openai_bbox = offset_bbox(openai_bbox_roi, dx=rx1, dy=ry1) if openai_bbox_roi else None
         roi_used = True
         roi_offset = (rx1, ry1)
 
     if openai_bbox is None:
         if debug:
-            # 디버그 저장(ROI 정보는 텍스트로라도 남기고 싶으면 openai_text에 추가 가능)
             save_debug_bundle(
                 index=out_idx,
                 bgr=image,
@@ -490,12 +544,12 @@ def crop_labels(image: np.ndarray, data_url: str, index: int, debug: bool = True
         print(f"[{out_idx:03d}] ❌ {why}. roi_info={roi_info if roi_bbox is not None else 'None'}")
         return
 
-    # 3) SAM refine (가능하면) — 기존 그대로
+    # SAM refine
     refined_bbox = None
     sam_mask = None
 
     if USE_SAM:
-        rb, sam_info = refine_bbox_with_sam(image, openai_bbox)
+        rb, sam_info = refine_bbox_with_sam(image_no_glare, openai_bbox)
         if rb is not None:
             refined_bbox = rb
         if isinstance(sam_info, dict) and sam_info.get("mask") is not None:
@@ -503,7 +557,7 @@ def crop_labels(image: np.ndarray, data_url: str, index: int, debug: bool = True
 
     final_bbox = refined_bbox if refined_bbox is not None else openai_bbox
 
-    # 4) crop + 저장 (원본 컬러)
+    # 저장은 원본 컬러 기준
     x1, y1, x2, y2 = final_bbox
     crop = image[y1:y2, x1:x2].copy()
 
@@ -513,13 +567,13 @@ def crop_labels(image: np.ndarray, data_url: str, index: int, debug: bool = True
     if ok:
         method = "openai+sam" if refined_bbox is not None else "openai_only"
         method += "+roi" if roi_used else ""
+        method += "+deglare"
+        method += "+mask_select"
         print(f"[{out_idx:03d}] ✅ Saved label crop: {out_path} ({method})")
     else:
         print(f"[{out_idx:03d}] ❌ Failed to save label crop: {out_path}")
 
-    # 5) debug 저장 — 기존 그대로
     if debug:
-        # openai_text에 ROI 정보를 조금 덧붙여 저장하면 분석 편함
         extra = ""
         if roi_bbox is not None:
             extra = f"\n\n[ROI]\nroi_bbox={roi_bbox}\nroi_info={roi_info}\nroi_offset={roi_offset}\n"
