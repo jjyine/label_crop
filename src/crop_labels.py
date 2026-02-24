@@ -121,6 +121,100 @@ def create_edge_assist_image(bgr: np.ndarray):
     return assist, edges, enhanced
 
 
+def find_label_roi_from_edges(
+    edges: np.ndarray,
+    image_shape,
+    debug: bool = False
+):
+    """
+    edges(0/255)에서 라벨 후보 ROI bbox를 찾는다.
+    반환: (x1,y1,x2,y2) or None, info dict
+    """
+    h, w = image_shape[:2]
+
+    # edges는 0/255 또는 0/1일 수 있으니 0/255로 정규화
+    e = edges.copy()
+    if e.dtype != np.uint8:
+        e = e.astype(np.uint8)
+    if e.max() == 1:
+        e = (e * 255).astype(np.uint8)
+
+    # 노이즈 줄이기: close로 끊긴 선을 좀 잇고, dilate로 덩어리화
+    kernel = np.ones((5, 5), np.uint8)
+    e2 = cv2.morphologyEx(e, cv2.MORPH_CLOSE, kernel, iterations=1)
+    e2 = cv2.dilate(e2, kernel, iterations=1)
+
+    # contour 추출
+    contours, _ = cv2.findContours(e2, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+
+    if not contours:
+        return None, {"reason": "no_contours"}
+
+    # 후보 필터링 + 스코어링
+    candidates = []
+    img_area = float(w * h)
+
+    # 라벨은 보통 병 몸통 중앙 근처에 있고, 너무 작지 않으며, 가로세로 비율이 극단적이지 않음
+    for cnt in contours:
+        x, y, cw, ch = cv2.boundingRect(cnt)
+        area = float(cw * ch)
+        if area < img_area * 0.02:   # 너무 작은 것 제거 (2% 미만)
+            continue
+        if area > img_area * 0.65:   # 너무 큰 것 제거 (병 전체/배경일 가능성)
+            continue
+
+        ar = cw / float(ch + 1e-6)
+
+        # 라벨 비율 가드 (상황 따라 조절)
+        # 와인 라벨은 대체로 0.5~2.5 사이에 많이 있음 (세로형/가로형 모두)
+        if ar < 0.35 or ar > 3.2:
+            continue
+
+        # 중앙성 점수: 라벨은 보통 중앙에 가까움
+        cx = x + cw / 2.0
+        cy = y + ch / 2.0
+        dist = ((cx - w/2.0)**2 + (cy - h/2.0)**2) ** 0.5
+        center_score = 1.0 - min(1.0, dist / (0.75 * (w**2 + h**2) ** 0.5))
+
+        # contour가 얼마나 "사각형에 가까운지": contour area / bbox area
+        cnt_area = float(cv2.contourArea(cnt))
+        rect_fill = cnt_area / (area + 1e-6)  # 1에 가까울수록 꽉 참
+
+        # 최종 점수(가중치): 면적 + 중앙성 + 사각형성
+        area_score = min(1.0, area / (img_area * 0.25))  # 25% 정도면 만점
+        score = 0.45 * area_score + 0.35 * center_score + 0.20 * rect_fill
+
+        candidates.append(((x, y, x+cw, y+ch), score, {"ar": ar, "rect_fill": rect_fill, "area": area}))
+
+    if not candidates:
+        return None, {"reason": "no_candidates_after_filter"}
+
+    # 점수 최고 후보 선택
+    candidates.sort(key=lambda t: t[1], reverse=True)
+    best_bbox, best_score, meta = candidates[0]
+
+    # ROI는 조금 여유롭게 확장 (라벨 경계 누락 방지)
+    pad = int(min(w, h) * 0.06)  # 6% 정도 (원하면 0.03~0.10 조절)
+    x1, y1, x2, y2 = clamp_bbox(*best_bbox, w, h, pad=pad)
+
+    info = {
+        "reason": "ok",
+        "best_score": best_score,
+        "meta": meta,
+        "raw_bbox": best_bbox,
+        "padded_bbox": (x1, y1, x2, y2),
+        "num_candidates": len(candidates),
+    }
+
+    return (x1, y1, x2, y2), info
+
+def offset_bbox(bbox, dx, dy):
+    if bbox is None:
+        return None
+    x1, y1, x2, y2 = bbox
+    return (x1 + dx, y1 + dy, x2 + dx, y2 + dy)
+
+
 # -----------------------------
 # OpenAI Vision: 컬러+보조 이미지로 bbox 받기
 # -----------------------------
@@ -336,11 +430,6 @@ def save_debug_bundle(index: int,
 # 메인 엔트리
 # -----------------------------
 def crop_labels(image: np.ndarray, data_url: str, index: int, debug: bool = True):
-    """
-    OpenAI Vision (컬러+엣지 보조 이미지)로 bbox 찾고,
-    가능하면 SAM으로 refine 후,
-    최종 crop을 원본 컬러로 저장.
-    """
     if image is None or not hasattr(image, "shape"):
         raise ValueError("image must be a valid OpenCV image (numpy array).")
 
@@ -359,12 +448,32 @@ def crop_labels(image: np.ndarray, data_url: str, index: int, debug: bool = True
     # 1) assist 이미지 생성
     assist, edges, enhanced_gray = create_edge_assist_image(image)
 
-    # 2) OpenAI bbox
-    openai_bbox, info = detect_bbox_with_openai(image, assist, data_url)
-    openai_text = info.get("response") if isinstance(info, dict) else None
+    # ✅ 2) edge 기반 ROI 찾기
+    roi_bbox, roi_info = find_label_roi_from_edges(edges, image.shape, debug=debug)
+
+    # ROI를 못 찾으면 기존 방식(전체 이미지로 OpenAI) fallback
+    if roi_bbox is None:
+        openai_bbox, info = detect_bbox_with_openai(image, assist, data_url)
+        openai_text = info.get("response") if isinstance(info, dict) else None
+        roi_used = False
+        roi_offset = (0, 0)
+    else:
+        rx1, ry1, rx2, ry2 = roi_bbox
+        roi_color = image[ry1:ry2, rx1:rx2].copy()
+        roi_assist = assist[ry1:ry2, rx1:rx2].copy()
+
+        # ✅ OpenAI는 ROI 안에서만 bbox 찾기
+        openai_bbox_roi, info = detect_bbox_with_openai(roi_color, roi_assist, data_url)
+        openai_text = info.get("response") if isinstance(info, dict) else None
+
+        # ROI 좌표계를 원본 좌표계로 복원
+        openai_bbox = offset_bbox(openai_bbox_roi, dx=rx1, dy=ry1) if openai_bbox_roi else None
+        roi_used = True
+        roi_offset = (rx1, ry1)
 
     if openai_bbox is None:
         if debug:
+            # 디버그 저장(ROI 정보는 텍스트로라도 남기고 싶으면 openai_text에 추가 가능)
             save_debug_bundle(
                 index=out_idx,
                 bgr=image,
@@ -377,10 +486,11 @@ def crop_labels(image: np.ndarray, data_url: str, index: int, debug: bool = True
                 openai_text=openai_text,
                 sam_mask=None
             )
-        print(f"[{out_idx:03d}] ❌ OpenAI bbox not found.")
+        why = "ROI used but OpenAI bbox not found" if roi_used else "OpenAI bbox not found"
+        print(f"[{out_idx:03d}] ❌ {why}. roi_info={roi_info if roi_bbox is not None else 'None'}")
         return
 
-    # 3) SAM refine (가능하면)
+    # 3) SAM refine (가능하면) — 기존 그대로
     refined_bbox = None
     sam_mask = None
 
@@ -402,12 +512,17 @@ def crop_labels(image: np.ndarray, data_url: str, index: int, debug: bool = True
 
     if ok:
         method = "openai+sam" if refined_bbox is not None else "openai_only"
+        method += "+roi" if roi_used else ""
         print(f"[{out_idx:03d}] ✅ Saved label crop: {out_path} ({method})")
     else:
         print(f"[{out_idx:03d}] ❌ Failed to save label crop: {out_path}")
 
-    # 5) debug 저장
+    # 5) debug 저장 — 기존 그대로
     if debug:
+        # openai_text에 ROI 정보를 조금 덧붙여 저장하면 분석 편함
+        extra = ""
+        if roi_bbox is not None:
+            extra = f"\n\n[ROI]\nroi_bbox={roi_bbox}\nroi_info={roi_info}\nroi_offset={roi_offset}\n"
         save_debug_bundle(
             index=out_idx,
             bgr=image,
@@ -417,6 +532,6 @@ def crop_labels(image: np.ndarray, data_url: str, index: int, debug: bool = True
             url=data_url,
             openai_bbox=openai_bbox,
             refined_bbox=refined_bbox,
-            openai_text=openai_text,
+            openai_text=(openai_text + extra) if openai_text else extra,
             sam_mask=sam_mask
         )
