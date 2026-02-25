@@ -122,12 +122,6 @@ def reduce_specular_glare(bgr: np.ndarray) -> np.ndarray:
 # ✅ SAM 멀티마스크 중 "라벨다운" 마스크 선택을 위한 스코어링
 # -----------------------------
 def score_label_mask(mask: np.ndarray, w: int, h: int) -> float:
-    """
-    mask가 라벨(종이 시트)처럼 보일수록 높은 점수를 준다.
-    - fill: bbox를 얼마나 꽉 채우는지 (로고만 잡으면 fill 낮음)
-    - center: 이미지 중심에 가까운지
-    - ar_pen: 비율이 너무 극단적이면 감점
-    """
     ys, xs = np.where(mask > 0)
     if len(xs) == 0:
         return -1e9
@@ -140,15 +134,14 @@ def score_label_mask(mask: np.ndarray, w: int, h: int) -> float:
     bbox_area = float(bw * bh) + 1e-6
     fill = area / bbox_area
 
+    # 비율 기반 점수
     ar = bw / float(bh + 1e-6)
     ar_pen = 1.0 if (0.35 <= ar <= 3.2) else 0.5
 
-    cx, cy = (x1 + x2) / 2.0, (y1 + y2) / 2.0
-    dist = ((cx - w / 2.0) ** 2 + (cy - h / 2.0) ** 2) ** 0.5
-    center = 1.0 - min(1.0, dist / (0.75 * (w * h) ** 0.5))
+    # y1에 기반한 위치 점수
+    position_score = 1.0 - min(1.0, y1 / (0.75 * h))
 
-    return (2.2 * fill + 0.6 * center) * ar_pen
-
+    return (2.0 * fill + 0.6 * position_score) * ar_pen
 
 # -----------------------------
 # Edge assist image 생성
@@ -493,27 +486,19 @@ def crop_labels(image: np.ndarray, data_url: str, index: int, debug: bool = True
 
     out_idx = index + 1
 
-    if debug and index == 0:
-        print("[DEBUG] cwd:", os.getcwd())
-        print("[DEBUG] OUT_DIR:", os.path.abspath(OUT_DIR))
-        print("[DEBUG] DEBUG_DIR:", os.path.abspath(DEBUG_DIR))
-        print("[DEBUG] OpenAI:", "ON" if _openai_client else "OFF")
-        print("[DEBUG] SAM:", "ON" if (USE_SAM and _sam_available) else "OFF (or not installed)")
-
-    # 전체 파이프라인 입력에서 glare 제거를 한 번 적용 (원본은 유지)
+    # 전체 파이프라인에서 glare 제거
     image_no_glare = reduce_specular_glare(image)
 
     # assist 이미지 생성
     assist, edges, enhanced_gray = create_edge_assist_image(image_no_glare)
 
-    # edge 기반 ROI 찾기
+    # 초기 ROI 찾기
     roi_bbox, roi_info = find_label_roi_from_edges(edges, image_no_glare.shape, debug=debug)
 
     if roi_bbox is None:
         openai_bbox, info = detect_bbox_with_openai(image_no_glare, assist, data_url)
         openai_text = info.get("response") if isinstance(info, dict) else None
         roi_used = False
-        roi_offset = (0, 0)
     else:
         rx1, ry1, rx2, ry2 = roi_bbox
         roi_color = image_no_glare[ry1:ry2, rx1:rx2].copy()
@@ -524,24 +509,9 @@ def crop_labels(image: np.ndarray, data_url: str, index: int, debug: bool = True
 
         openai_bbox = offset_bbox(openai_bbox_roi, dx=rx1, dy=ry1) if openai_bbox_roi else None
         roi_used = True
-        roi_offset = (rx1, ry1)
 
     if openai_bbox is None:
-        if debug:
-            save_debug_bundle(
-                index=out_idx,
-                bgr=image,
-                assist=assist,
-                enhanced_gray=enhanced_gray,
-                edges=edges,
-                url=data_url,
-                openai_bbox=None,
-                refined_bbox=None,
-                openai_text=openai_text,
-                sam_mask=None
-            )
-        why = "ROI used but OpenAI bbox not found" if roi_used else "OpenAI bbox not found"
-        print(f"[{out_idx:03d}] ❌ {why}. roi_info={roi_info if roi_bbox is not None else 'None'}")
+        print(f"[{out_idx:03d}] ❌ OpenAI bbox not found")
         return
 
     # SAM refine
@@ -555,37 +525,38 @@ def crop_labels(image: np.ndarray, data_url: str, index: int, debug: bool = True
         if isinstance(sam_info, dict) and sam_info.get("mask") is not None:
             sam_mask = sam_info["mask"]
 
+    # 초기 크롭 박스 설정 (30% 여유)
     final_bbox = refined_bbox if refined_bbox is not None else openai_bbox
-
-    # 저장은 원본 컬러 기준
+    pad = int(min(image.shape[:2]) * 0.25)  # 여유를 30%로 설정
     x1, y1, x2, y2 = final_bbox
+    x1, y1, x2, y2 = clamp_bbox(x1, y1, x2, y2, image.shape[1], image.shape[0], pad=pad)
+
+    # 크롭 및 저장
     crop = image[y1:y2, x1:x2].copy()
-
     out_path = os.path.join(OUT_DIR, OUT_LABEL_TEMPLATE.format(out_idx))
-    ok = cv2.imwrite(out_path, crop)
-
-    if ok:
-        method = "openai+sam" if refined_bbox is not None else "openai_only"
-        method += "+roi" if roi_used else ""
-        method += "+deglare"
-        method += "+mask_select"
-        print(f"[{out_idx:03d}] ✅ Saved label crop: {out_path} ({method})")
+    
+    if cv2.imwrite(out_path, crop):
+        print(f"[{out_idx:03d}] ✅ Saved label crop: {out_path} (initial crop with padding)")
     else:
-        print(f"[{out_idx:03d}] ❌ Failed to save label crop: {out_path}")
+        print(f"[{out_idx:03d}] ❌ Failed to save label crop.")
+
+    # 세밀한 조정을 위해 반복
+    for i in range(2):  # 2회 반복하여 크롭 범위를 줄임
+        # 여유를 줄여서 새로운 크롭 박스 설정
+        pad = int(min(image.shape[:2]) * 0.1)  # 여유를 10%로 설정
+        x1, y1, x2, y2 = final_bbox
+        x1, y1, x2, y2 = clamp_bbox(x1, y1, x2, y2, image.shape[1], image.shape[0], pad=pad)
+
+        crop = image[y1:y2, x1:x2].copy()
+        out_path = os.path.join(OUT_DIR, OUT_LABEL_TEMPLATE.format(out_idx))
+
+        if cv2.imwrite(out_path, crop):
+            print(f"[{out_idx:03d}] ✅ Saved refined label crop: {out_path} (iteration {i+1})")
+            break  # 성공적으로 저장하면 반복 중지
+    else:
+        print(f"[{out_idx:03d}] ❌ Failed to save refined label crop.")
 
     if debug:
-        extra = ""
-        if roi_bbox is not None:
-            extra = f"\n\n[ROI]\nroi_bbox={roi_bbox}\nroi_info={roi_info}\nroi_offset={roi_offset}\n"
-        save_debug_bundle(
-            index=out_idx,
-            bgr=image,
-            assist=assist,
-            enhanced_gray=enhanced_gray,
-            edges=edges,
-            url=data_url,
-            openai_bbox=openai_bbox,
-            refined_bbox=refined_bbox,
-            openai_text=(openai_text + extra) if openai_text else extra,
-            sam_mask=sam_mask
-        )
+        save_debug_bundle(index=out_idx, bgr=image, assist=assist, enhanced_gray=enhanced_gray,
+                          edges=edges, url=data_url, openai_bbox=openai_bbox,
+                          refined_bbox=refined_bbox, openai_text=openai_text, sam_mask=sam_mask)

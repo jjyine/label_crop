@@ -3,8 +3,8 @@ from src.fetch_data import fetch_data
 from src.crop_labels import crop_labels
 
 def main():
-    limit = 5  # 한 번에 가져올 이미지 개수
-    total_results = 5  # 총 가져올 이미지 수
+    limit = 30  # 한 번에 가져올 이미지 개수
+    total_results = 30  # 총 가져올 이미지 수
 
     for i, (image, data_url) in enumerate(fetch_data(limit=limit, total_results=total_results)):
         # 라벨 크롭 수행
