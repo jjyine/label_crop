@@ -1,4 +1,3 @@
-# fetch_data.py
 import os
 import re
 import json
@@ -21,8 +20,7 @@ db_user = os.getenv("DB_USER")
 db_password = os.getenv("DB_PASSWORD")
 db_name = os.getenv("DB_NAME")
 
-OPENAI_VISION_MODEL = os.getenv("OPENAI_VISION_MODEL", "gpt-4o-mini")
-OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
+GEMINI_API_KEY = os.getenv("GEMINI_API_KEY")
 
 # SAM
 USE_SAM = os.getenv("USE_SAM", "1") == "1"
@@ -35,16 +33,15 @@ DEBUG_DIR = os.path.join(os.getcwd(), "out_debug")
 os.makedirs(OUT_DIR, exist_ok=True)
 os.makedirs(DEBUG_DIR, exist_ok=True)
 
-
 # -----------------------------
-# OpenAI client (optional)
+# Google Generative AI client
 # -----------------------------
 try:
-    from openai import OpenAI
-    _openai_client = OpenAI(api_key=OPENAI_API_KEY) if OPENAI_API_KEY else None
+    from google.genai import Client  # Google Generative AI 클라이언트 임포트ㅐ
+    from google.genai import types
+    _gemini_client = Client(api_key=GEMINI_API_KEY) if GEMINI_API_KEY else None
 except Exception:
-    _openai_client = None
-
+    _gemini_client = None
 
 # -----------------------------
 # SAM imports (optional)
@@ -58,7 +55,6 @@ except Exception:
 
 _DEVICE = "cuda" if (_sam_available and torch.cuda.is_available()) else "cpu"
 _sam_predictor = None
-
 
 # -----------------------------
 # DB 이미지 선택 + fetch
@@ -89,7 +85,6 @@ def select_largest_vivino_image(image_data):
             selected_key = s3_key
 
     return selected_image, selected_key
-
 
 def fetch_data(limit=5, total_results=5):
     connection = None
@@ -140,14 +135,12 @@ def fetch_data(limit=5, total_results=5):
         if connection:
             connection.close()
 
-
 # -----------------------------
 # 유틸
 # -----------------------------
 def safe_filename(url: str) -> str:
     name = re.sub(r"[^a-zA-Z0-9]+", "_", url)
     return name[-80:]
-
 
 def clamp_xyxy(x1, y1, x2, y2, w, h, pad=0):
     x1 = max(0, int(x1) - pad)
@@ -160,14 +153,12 @@ def clamp_xyxy(x1, y1, x2, y2, w, h, pad=0):
         y2 = min(h - 1, y1 + 1)
     return x1, y1, x2, y2
 
-
 def encode_bgr_to_data_url_png(bgr: np.ndarray) -> str:
     ok, buf = cv2.imencode(".png", bgr)
     if not ok:
         raise ValueError("cv2.imencode failed")
     b64 = base64.b64encode(buf).decode("utf-8")
     return f"data:image/png;base64,{b64}"
-
 
 def safe_json_extract(text: str) -> dict:
     try:
@@ -179,15 +170,10 @@ def safe_json_extract(text: str) -> dict:
         return json.loads(m.group(0))
     raise ValueError("Could not parse JSON from model output.")
 
-
 # -----------------------------
 # 1) EDGES -> candidate box
 # -----------------------------
 def create_edge_assist_image(bgr: np.ndarray):
-    """
-    - gray + CLAHE + Canny + dilate
-    - assist: gray(3ch)에 edge를 흰색으로 표시
-    """
     gray = cv2.cvtColor(bgr, cv2.COLOR_BGR2GRAY)
 
     clahe = cv2.createCLAHE(clipLimit=2.0, tileGridSize=(8, 8))
@@ -201,16 +187,9 @@ def create_edge_assist_image(bgr: np.ndarray):
 
     return assist, edges, enhanced
 
-
 def find_label_candidate_box_from_edges(edges: np.ndarray):
-    """
-    edges(0/255)에서 라벨 후보 박스(대략)를 찾음.
-    핵심: edge를 좀 뭉쳐서(contour) 사각형 후보를 고르고,
-    중앙~하단 / 적당한 비율 / 충분한 면적을 점수화해서 베스트 선택.
-    """
     h, w = edges.shape[:2]
 
-    # edges를 덩어리로 만들기
     work = edges.copy()
     work = cv2.morphologyEx(work, cv2.MORPH_CLOSE, np.ones((9, 9), np.uint8), iterations=2)
     work = cv2.dilate(work, np.ones((7, 7), np.uint8), iterations=1)
@@ -227,17 +206,14 @@ def find_label_candidate_box_from_edges(edges: np.ndarray):
             continue
 
         aspect = cw / max(1, ch)
-        # 라벨은 "대충 직사각형 영역"이 많아서 너무 세로/가로 극단은 제외
         if not (0.55 <= aspect <= 3.8):
             continue
 
-        # 위치 점수: 중앙 + 하단 근처 선호
         cx = x + cw / 2
         cy = y + ch / 2
         center_bonus = 1.0 - (abs(cx - w / 2) / (w / 2)) * 0.7
         vertical_bonus = 1.0 - (abs(cy - h * 0.62) / (h * 0.62)) * 0.7
 
-        # 너무 위(목쪽)면 강하게 패널티
         if cy < h * 0.22:
             vertical_bonus *= 0.2
 
@@ -251,7 +227,6 @@ def find_label_candidate_box_from_edges(edges: np.ndarray):
         return None, work
 
     x1, y1, x2, y2 = best
-    # 약간 확장 (OpenAI/SAM이 경계 잡기 좋게)
     pad_x = int((x2 - x1) * 0.10)
     pad_y = int((y2 - y1) * 0.12)
     x1, y1, x2, y2 = clamp_xyxy(x1, y1, x2, y2, w, h, pad=0)
@@ -262,15 +237,19 @@ def find_label_candidate_box_from_edges(edges: np.ndarray):
 
     return np.array([x1, y1, x2, y2], dtype=np.int32), work
 
+# -----------------------------
+# 2) Google Generative AI -> bbox refine (candidate box 기반)
+# -----------------------------
+import time
 
-# -----------------------------
-# 2) OpenAI -> bbox refine (candidate box 기반)
-# -----------------------------
-def openai_refine_bbox(color_bgr: np.ndarray, assist_bgr: np.ndarray, candidate_box_xyxy: np.ndarray | None):
-    if _openai_client is None:
+def gemini_refine_bbox(color_bgr: np.ndarray, assist_bgr: np.ndarray, candidate_box_xyxy: np.ndarray | None):
+    if _gemini_client is None:
+        print("[DEBUG] Gemini client is not initialized.")
         return None, None
 
     h, w = color_bgr.shape[:2]
+    
+    # 1. 이미지를 Base64 데이터 URL로 인코딩
     color_data = encode_bgr_to_data_url_png(color_bgr)
     assist_data = encode_bgr_to_data_url_png(assist_bgr)
 
@@ -280,81 +259,75 @@ def openai_refine_bbox(color_bgr: np.ndarray, assist_bgr: np.ndarray, candidate_
         cand_txt = f"[{x1}, {y1}, {x2}, {y2}]"
 
     instruction = f"""
-You are given TWO images:
-(1) Original COLOR image of a wine bottle.
-(2) Edge-enhanced GRAYSCALE assist image (white lines are strong edges).
+    You are given TWO images: (1) Original COLOR, (2) Edge assist.
+    Initial candidate box = {cand_txt}
+    Return ONLY valid JSON with a tight bounding box around the wine label:
+    {{"label_bboxes": [{{"x1": int, "y1": int, "x2": int, "y2": int}}]}}
+    Image size: width={w}, height={h}
+    """
 
-We also provide an initial candidate box (xyxy) computed from edges:
-candidate_box = {cand_txt}
+    # 2. 재시도 로직 설정
+    max_retries = 3
+    wait_time = 5  # 429 에러 시 대기 시간 (초)
 
-Task:
-Return a TIGHT bounding box around ONLY the front paper label on the bottle body.
+    for attempt in range(max_retries):
+        try:
+            print(f"[DEBUG] Calling Gemini API (Attempt {attempt+1})...")
+            time.sleep(1.2)
+            
+            resp = _gemini_client.models.generate_content(
+                model="gemini-2.0-flash", 
+                contents=[
+                    instruction,
+                    Image.fromarray(cv2.cvtColor(color_bgr, cv2.COLOR_BGR2RGB)),
+                    Image.fromarray(cv2.cvtColor(assist_bgr, cv2.COLOR_BGR2RGB))
+                ],      
+                config=types.GenerateContentConfig(
+                    temperature=0.0,  
+                    response_mime_type="application/json" 
+                )
+            )
+            
+            # 응답 텍스트 추출
+            resp_text = resp.text
+            print("[DEBUG] Gemini API response received.")
+            break  
+            
+        except Exception as e:
+            err_msg = str(e)
+            if "429" in err_msg or "RESOURCE_EXHAUSTED" in err_msg:
+                if attempt < max_retries - 1:
+                    print(f"[RETRY] 쿼타 초과(429). {wait_time}초 후 다시 시도합")
+                    time.sleep(wait_time)
+                    wait_time *= 2 
+                    continue
+            
+            print(f"[ERROR] Gemini API call failed: {e}")
+            return None, None
 
-Rules:
-- Use candidate_box as a strong hint. The label is very likely inside/near it.
-- Use the assist image to align with real label boundaries (top/bottom especially).
-- Do NOT include bottle neck/capsule.
-- Do NOT include bottle glass outside the paper label.
-- Do NOT include background.
-
-Return ONLY valid JSON:
-{{
-  "label_bboxes": [{{"x1": int, "y1": int, "x2": int, "y2": int}}],
-  "notes": "short"
-}}
-
-Image size: width={w}, height={h}
-"""
-
-    resp = _openai_client.responses.create(
-        model=OPENAI_VISION_MODEL,
-        input=[{
-            "role": "user",
-            "content": [
-                {"type": "input_text", "text": instruction},
-                {"type": "input_image", "image_url": color_data},
-                {"type": "input_image", "image_url": assist_data},
-            ],
-        }],
-    )
-
-    text = getattr(resp, "output_text", None)
-    if not text:
-        parts = []
-        for item in getattr(resp, "output", []):
-            if isinstance(item, dict) and item.get("type") == "message":
-                for c in item.get("content", []):
-                    if c.get("type") in ("output_text", "text"):
-                        parts.append(c.get("text", ""))
-        text = "\n".join(parts).strip()
-
+    # 3. 결과 파싱
     try:
-        data = safe_json_extract(text)
-    except Exception:
-        return None, text
+        data = safe_json_extract(resp_text)
+        bboxes = data.get("label_bboxes", [])
+        if not bboxes:
+            return None, resp_text
 
-    bboxes = data.get("label_bboxes", [])
-    if not isinstance(bboxes, list) or len(bboxes) == 0:
-        return None, text
+        # 가장 큰 박스 선택 로직
+        cand = []
+        for b in bboxes:
+            x1, y1, x2, y2 = clamp_xyxy(b["x1"], b["y1"], b["x2"], b["y2"], w, h)
+            cand.append((x1, y1, x2, y2))
+        
+        areas = [(x2 - x1) * (y2 - y1) for (x1, y1, x2, y2) in cand]
+        best = cand[int(np.argmax(areas))]
+        return best, resp_text
 
-    # 여러개면 가장 큰 면적 선택
-    cand = []
-    for b in bboxes:
-        if not all(k in b for k in ("x1", "y1", "x2", "y2")):
-            continue
-        x1, y1, x2, y2 = clamp_xyxy(b["x1"], b["y1"], b["x2"], b["y2"], w, h, pad=int(min(w, h) * 0.01))
-        cand.append((x1, y1, x2, y2))
-
-    if not cand:
-        return None, text
-
-    areas = [(x2 - x1) * (y2 - y1) for (x1, y1, x2, y2) in cand]
-    best = cand[int(np.argmax(areas))]
-    return best, text
-
-
+    except Exception as e:
+        print(f"[ERROR] JSON parsing failed: {e}")
+        return None, resp_text
+    
 # -----------------------------
-# 3) SAM refine (OpenAI bbox 기반)
+# 3) SAM refine (Google bbox 기반)
 # -----------------------------
 def get_sam_predictor():
     global _sam_predictor
@@ -374,7 +347,6 @@ def get_sam_predictor():
     _sam_predictor = SamPredictor(sam)
     print(f"[SAM] loaded: type={SAM_MODEL_TYPE}, device={_DEVICE}, ckpt={SAM_CHECKPOINT}")
     return _sam_predictor
-
 
 def refine_bbox_with_sam(bgr: np.ndarray, init_bbox_xyxy: tuple[int, int, int, int]):
     predictor = get_sam_predictor()
@@ -402,11 +374,9 @@ def refine_bbox_with_sam(bgr: np.ndarray, init_bbox_xyxy: tuple[int, int, int, i
     rx1, ry1, rx2, ry2 = clamp_xyxy(rx1, ry1, rx2, ry2, w, h, pad=int(min(w, h) * 0.005))
     return (rx1, ry1, rx2, ry2), mask
 
-
 def crop_by_xyxy(bgr: np.ndarray, xyxy: tuple[int, int, int, int]) -> np.ndarray:
     x1, y1, x2, y2 = xyxy
     return bgr[y1:y2, x1:x2].copy()
-
 
 # -----------------------------
 # 디버깅 저장
@@ -418,10 +388,9 @@ def save_debug(idx: int,
                edges: np.ndarray,
                edges_work: np.ndarray,
                candidate_box: np.ndarray | None,
-               openai_bbox: tuple[int, int, int, int] | None,
+               gemini_bbox: tuple[int, int, int, int] | None,
                sam_bbox: tuple[int, int, int, int] | None,
-               sam_mask: np.ndarray | None,
-               openai_text: str | None):
+               sam_mask: np.ndarray | None):
     base = safe_filename(url)
     prefix = f"{idx:03d}_{base}"
 
@@ -438,15 +407,15 @@ def save_debug(idx: int,
         cv2.putText(overlay, "edges_cand", (x1, max(0, y1 - 10)),
                     cv2.FONT_HERSHEY_SIMPLEX, 0.7, (255, 0, 255), 2, cv2.LINE_AA)
 
-    if openai_bbox is not None:
-        x1, y1, x2, y2 = openai_bbox
-        cv2.rectangle(overlay, (x1, y1), (x2, y2), (0, 255, 255), 3)  # 노랑: openai
-        cv2.putText(overlay, "openai", (x1, max(0, y1 - 10)),
+    if gemini_bbox is not None:
+        x1, y1, x2, y2 = gemini_bbox
+        cv2.rectangle(overlay, (x1, y1), (x2, y2), (0, 255, 255), 3)  # 노랑: Google Generative AI
+        cv2.putText(overlay, "gemini", (x1, max(0, y1 - 10)),
                     cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 255), 2, cv2.LINE_AA)
 
     if sam_bbox is not None:
         x1, y1, x2, y2 = sam_bbox
-        cv2.rectangle(overlay, (x1, y1), (x2, y2), (0, 255, 0), 3)  # 초록: sam
+        cv2.rectangle(overlay, (x1, y1), (x2, y2), (0, 255, 0), 3)  # 초록: SAM
         cv2.putText(overlay, "sam", (x1, max(0, y1 - 10)),
                     cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 0), 2, cv2.LINE_AA)
 
@@ -461,34 +430,22 @@ def save_debug(idx: int,
         mask_overlay[m] = cv2.addWeighted(mask_overlay[m], 0.4, white[m], 0.6, 0)
         cv2.imwrite(os.path.join(DEBUG_DIR, f"{prefix}_sam_overlay.png"), mask_overlay)
 
-    if openai_text:
-        with open(os.path.join(DEBUG_DIR, f"{prefix}_openai_response.txt"), "w", encoding="utf-8") as f:
-            f.write(openai_text)
-
-
 # -----------------------------
-# edges -> OpenAI -> SAM 파이프라인
+# edges -> Google Generative AI -> SAM 파이프라인
 # -----------------------------
-def detect_label_edges_openai_sam(bgr: np.ndarray, url: str):
-    """
-    반환:
-      final_bbox_xyxy or None,
-      debug dict
-    """
+def detect_label_edges_gemini_sam(bgr: np.ndarray, url: str):
     assist, edges, enhanced = create_edge_assist_image(bgr)
     candidate_box, edges_work = find_label_candidate_box_from_edges(edges)
 
-    # 기본은 edges candidate 를 시작점으로 (OpenAI/SAM 실패 시 fallback)
     edges_bbox = None
     if candidate_box is not None:
         x1, y1, x2, y2 = map(int, candidate_box.tolist())
         edges_bbox = (x1, y1, x2, y2)
 
-    # 2) OpenAI refine (edges candidate hint)
-    openai_bbox, openai_text = openai_refine_bbox(bgr, assist, candidate_box)
+    # 2) Google Generative AI refine (edges candidate hint)
+    gemini_bbox, gemini_response = gemini_refine_bbox(bgr, assist, candidate_box)
 
-    # OpenAI가 실패하면 edges_bbox를 쓴다
-    base_bbox = openai_bbox if openai_bbox is not None else edges_bbox
+    base_bbox = gemini_bbox if gemini_bbox is not None else edges_bbox
 
     # 3) SAM refine (base_bbox 기반)
     sam_bbox = None
@@ -501,18 +458,16 @@ def detect_label_edges_openai_sam(bgr: np.ndarray, url: str):
 
     final_bbox = sam_bbox if sam_bbox is not None else base_bbox
 
-    debug = {
+    return final_bbox, {
         "assist": assist,
         "edges": edges,
         "edges_work": edges_work,
         "candidate_box": candidate_box,
-        "openai_bbox": openai_bbox,
+        "gemini_bbox": gemini_bbox,
+        "gemini_response": gemini_response,
         "sam_bbox": sam_bbox,
         "sam_mask": sam_mask,
-        "openai_text": openai_text,
     }
-    return final_bbox, debug
-
 
 # -----------------------------
 # main
@@ -520,11 +475,11 @@ def detect_label_edges_openai_sam(bgr: np.ndarray, url: str):
 if __name__ == "__main__":
     print("[DEBUG] OUT_DIR:", OUT_DIR)
     print("[DEBUG] DEBUG_DIR:", DEBUG_DIR)
-    print("[DEBUG] OpenAI:", "ON" if _openai_client else "OFF")
+    print("[DEBUG] Google Generative AI:", "ON" if _gemini_client else "OFF")
     print("[DEBUG] SAM:", "ON" if (USE_SAM and _sam_available and os.path.exists(SAM_CHECKPOINT)) else "OFF")
 
     for i, (img_cv, url) in enumerate(fetch_data(limit=5, total_results=5), start=1):
-        final_bbox, dbg = detect_label_edges_openai_sam(img_cv, url)
+        final_bbox, dbg = detect_label_edges_gemini_sam(img_cv, url)
 
         # 디버그 항상 저장
         save_debug(
@@ -535,14 +490,13 @@ if __name__ == "__main__":
             edges=dbg["edges"],
             edges_work=dbg["edges_work"],
             candidate_box=dbg["candidate_box"],
-            openai_bbox=dbg["openai_bbox"],
+            gemini_bbox=dbg["gemini_bbox"],
             sam_bbox=dbg["sam_bbox"],
             sam_mask=dbg["sam_mask"],
-            openai_text=dbg["openai_text"],
         )
 
         if final_bbox is None:
-            print(f"[{i:03d}] ❌ label not found:", url)
+            print(f"[{i:03d}] label not found:", url)
             continue
 
         crop = crop_by_xyxy(img_cv, final_bbox)
@@ -551,5 +505,6 @@ if __name__ == "__main__":
         out_img = os.path.join(OUT_DIR, f"{i:03d}_{base}_label.png")
         cv2.imwrite(out_img, crop)
 
-        method = "sam" if dbg["sam_bbox"] is not None else ("openai" if dbg["openai_bbox"] is not None else "edges")
-        print(f"[{i:03d}] ✅ saved: {out_img} ({method})")
+        method = "sam" if dbg["sam_bbox"] is not None else ("gemini" if dbg["gemini_bbox"] is not None else "edges")
+        print(f"[{i:03d}] saved: {out_img} ({method})")
+        time.sleep(1.0)
