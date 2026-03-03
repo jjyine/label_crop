@@ -236,7 +236,7 @@ def detect_bbox_with_gemini(color_bgr: np.ndarray, assist_bgr: np.ndarray, origi
     try:
         # 에러 해결을 위한 새로운 호출 방식
         response = _gemini_client.models.generate_content(
-            model="gemini-2.0-flash",
+            model="gemini-2.5-flash",
             contents=[
                 types.Content(
                     role="user",
@@ -430,48 +430,34 @@ def crop_labels(image: np.ndarray, data_url: str, index: int, debug: bool = True
 
     out_idx = index + 1
 
-    # 전체 파이프라인에서 glare 제거
-    image_no_glare = reduce_specular_glare(image)
-
-    # assist 이미지 생성
-    assist, edges, enhanced_gray = create_edge_assist_image(image_no_glare)
-
-    # 초기 ROI 찾기
-    roi_bbox, roi_info = find_label_roi_from_edges(edges, image_no_glare.shape, debug=debug)
-
-    if roi_bbox is None:
-        gemini_bbox, info = detect_bbox_with_gemini(image_no_glare, assist, data_url)
-        gemini_text = info.get("response") if isinstance(info, dict) else None
-        roi_used = False
-    else:
-        rx1, ry1, rx2, ry2 = roi_bbox
-        roi_color = image_no_glare[ry1:ry2, rx1:rx2].copy()
-        roi_assist = assist[ry1:ry2, rx1:rx2].copy()
-
-        gemini_bbox_roi, info = detect_bbox_with_gemini(roi_color, roi_assist, data_url)
-        gemini_text = info.get("response") if isinstance(info, dict) else None
-
-        gemini_bbox = offset_bbox(gemini_bbox_roi, dx=rx1, dy=ry1) if gemini_bbox_roi else None
-        roi_used = True
+    # Gemini AI로부터 bbox를 찾기
+    gemini_bbox, info = detect_bbox_with_gemini(image, image, data_url)  # glare 및 assist 이미지 없이 사용
+    gemini_text = info.get("response") if isinstance(info, dict) else None
 
     if gemini_bbox is None:
         print(f"[{out_idx:03d}] ❌ Gemini bbox not found")
         return
+    
+    padding = 10
+
+    # 패딩을 추가하여 bounding box 확장
+    x1, y1, x2, y2 = gemini_bbox
+    x1, y1, x2, y2 = clamp_bbox(x1 - padding, y1 - padding, x2 + padding, y2 + padding, image.shape[1], image.shape[0])
 
     # SAM refine
     refined_bbox = None
     sam_mask = None
 
     if USE_SAM:
-        rb, sam_info = refine_bbox_with_sam(image_no_glare, gemini_bbox)
+        rb, sam_info = refine_bbox_with_sam(image, (x1, y1, x2, y2))
         if rb is not None:
             refined_bbox = rb
         if isinstance(sam_info, dict) and sam_info.get("mask") is not None:
             sam_mask = sam_info["mask"]
 
-    # 초기 크롭 박스 설정 (30% 여유)
-    final_bbox = refined_bbox if refined_bbox is not None else gemini_bbox
-    pad = int(min(image.shape[:2]) * 0.25)  # 여유를 30%로 설정
+    # 초기 크롭 박스 설정 
+    final_bbox = refined_bbox if refined_bbox is not None else (x1, y1, x2, y2)
+    pad = int(min(image.shape[:2]) * 0.3)  # 여유
     x1, y1, x2, y2 = final_bbox
     x1, y1, x2, y2 = clamp_bbox(x1, y1, x2, y2, image.shape[1], image.shape[0], pad=pad)
 
@@ -487,7 +473,7 @@ def crop_labels(image: np.ndarray, data_url: str, index: int, debug: bool = True
     # 세밀한 조정을 위해 반복
     for i in range(2):  # 2회 반복하여 크롭 범위를 줄임
         # 여유를 줄여서 새로운 크롭 박스 설정
-        pad = int(min(image.shape[:2]) * 0.1)  # 여유를 10%로 설정
+        pad = int(min(image.shape[:2]) * 0.0)  # 여유를 5%로 설정
         x1, y1, x2, y2 = final_bbox
         x1, y1, x2, y2 = clamp_bbox(x1, y1, x2, y2, image.shape[1], image.shape[0], pad=pad)
 
@@ -498,9 +484,9 @@ def crop_labels(image: np.ndarray, data_url: str, index: int, debug: bool = True
             print(f"[{out_idx:03d}] Saved refined label crop: {out_path} (iteration {i+1})")
             break  # 성공적으로 저장하면 반복 중지
     else:
-        print(f"[{out_idx:03d}] ❌ Failed to save refined label crop.")
+        print(f"[{out_idx:03d}] Failed to save refined label crop.")
 
     if debug:
-        save_debug_bundle(index=out_idx, bgr=image, assist=assist, enhanced_gray=enhanced_gray,
-                          edges=edges, url=data_url, gemini_bbox=gemini_bbox,
+        save_debug_bundle(index=out_idx, bgr=image, assist=None, enhanced_gray=None,
+                          edges=None, url=data_url, gemini_bbox=gemini_bbox,
                           refined_bbox=refined_bbox, gemini_text=gemini_text, sam_mask=sam_mask)
