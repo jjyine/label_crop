@@ -136,7 +136,14 @@ def score_label_mask(mask: np.ndarray, w: int, h: int) -> float:
 
     ar = bw / float(bh + 1e-6)
     ar_pen = 1.0 if (0.35 <= ar <= 3.2) else 0.5
-    position_score = 1.0 - min(1.0, y1 / (0.75 * h))
+
+    # 중앙, 상단, 하단 각각의 점수 계산
+    top_score = max(0, (0.5 * h - y1) / (0.5 * h))  # 상단 영역
+    middle_score = max(0, 1 - abs((y1 + bh / 2) - (h / 2)) / (0.25 * h))  # 중앙 영역
+    bottom_score = max(0, (y2 - 0.5 * h) / (0.5 * h))  # 하단 영역
+
+    # 최종 점수 계산
+    position_score = (top_score + middle_score + bottom_score) / 3
 
     return (2.0 * fill + 0.6 * position_score) * ar_pen
 
@@ -257,7 +264,7 @@ def detect_bbox_with_gemini(color_bgr: np.ndarray, assist_bgr: np.ndarray, origi
     try:
         # 에러 해결을 위한 새로운 호출 방식
         response = _gemini_client.models.generate_content(
-            model="gemini-3-flash",
+            model="gemini-3-flash-preview",
             contents=[
                 types.Content(
                     role="user",
