@@ -2,8 +2,8 @@ import os
 import re
 import json
 import base64
-import cv2
 import numpy as np
+import cv2
 
 # -----------------------------
 # 환경 설정
@@ -83,6 +83,7 @@ def safe_json_extract(text: str) -> dict:
     raise ValueError("Could not parse JSON from model output.")
 
 def encode_bgr_to_data_url_png(bgr: np.ndarray) -> str:
+    import cv2  # OpenCV를 함수 내부에서만 사용
     ok, buf = cv2.imencode(".png", bgr)
     if not ok:
         raise ValueError("cv2.imencode failed")
@@ -93,6 +94,7 @@ def encode_bgr_to_data_url_png(bgr: np.ndarray) -> str:
 # 하이라이트(반사) 제거: Specular Glare Reduction
 # -----------------------------
 def reduce_specular_glare(bgr: np.ndarray) -> np.ndarray:
+    import cv2  # OpenCV를 함수 내부에서만 사용
     hsv = cv2.cvtColor(bgr, cv2.COLOR_BGR2HSV)
     glare = cv2.inRange(hsv, (0, 0, 210), (180, 60, 255))
     k = np.ones((5, 5), np.uint8)
@@ -102,7 +104,22 @@ def reduce_specular_glare(bgr: np.ndarray) -> np.ndarray:
     return out
 
 # -----------------------------
-# ✅ SAM 멀티마스크 중 "라벨다운" 마스크 선택을 위한 스코어링
+# 이미지 전처리: 대비 조정 및 배경 제거
+# -----------------------------
+def preprocess_image(image: np.ndarray) -> np.ndarray:
+    import cv2  # OpenCV를 함수 내부에서만 사용
+    # 대비 조정
+    alpha = 1.5  # 대비
+    beta = 30    # 밝기
+    adjusted_image = cv2.convertScaleAbs(image, alpha=alpha, beta=beta)
+
+    # 배경 흐리게 (노이즈 제거)
+    blurred_image = cv2.GaussianBlur(adjusted_image, (5, 5), 0)
+
+    return blurred_image
+
+# -----------------------------
+# SAM 멀티마스크 중 "라벨다운" 마스크 선택을 위한 스코어링
 # -----------------------------
 def score_label_mask(mask: np.ndarray, w: int, h: int) -> float:
     ys, xs = np.where(mask > 0)
@@ -127,6 +144,7 @@ def score_label_mask(mask: np.ndarray, w: int, h: int) -> float:
 # Edge assist image 생성
 # -----------------------------
 def create_edge_assist_image(bgr: np.ndarray):
+    import cv2  # OpenCV를 함수 내부에서만 사용
     bgr_no_glare = reduce_specular_glare(bgr)
     gray = cv2.cvtColor(bgr_no_glare, cv2.COLOR_BGR2GRAY)
     clahe = cv2.createCLAHE(clipLimit=2.0, tileGridSize=(8, 8))
@@ -139,6 +157,7 @@ def create_edge_assist_image(bgr: np.ndarray):
     return assist, edges, enhanced
 
 def find_label_roi_from_edges(edges: np.ndarray, image_shape, debug: bool = False):
+    import cv2  # OpenCV를 함수 내부에서만 사용
     h, w = image_shape[:2]
     e = edges.copy()
     if e.dtype != np.uint8:
@@ -218,6 +237,7 @@ def detect_bbox_with_gemini(color_bgr: np.ndarray, assist_bgr: np.ndarray, origi
 
     # 이미지를 API에 보낼 수 있는 바이트 포맷으로 변환하는 내부 함수
     def bgr_to_bytes(img):
+        import cv2  # OpenCV를 함수 내부에서만 사용
         _, buffer = cv2.imencode('.png', img)
         return buffer.tobytes()
 
@@ -225,6 +245,7 @@ def detect_bbox_with_gemini(color_bgr: np.ndarray, assist_bgr: np.ndarray, origi
     instruction = f"""
     당신은 이미지 내의 라벨(Label)을 찾는 전문가입니다.
     제공된 컬러 이미지와 엣지(Edge) 보조 이미지를 참고하여, 물체 정면에 붙은 '라벨'의 좌표를 찾으세요.
+    하이라이트(반사광)를 무시하고 라벨만 인식하세요
     반드시 다음 JSON 형식으로만 답변하세요:
     {{
       "label_bboxes": [{{"x1": int, "y1": int, "x2": int, "y2": int}}],
@@ -236,7 +257,7 @@ def detect_bbox_with_gemini(color_bgr: np.ndarray, assist_bgr: np.ndarray, origi
     try:
         # 에러 해결을 위한 새로운 호출 방식
         response = _gemini_client.models.generate_content(
-            model="gemini-2.5-flash",
+            model="gemini-3-flash",
             contents=[
                 types.Content(
                     role="user",
@@ -363,6 +384,23 @@ def refine_bbox_with_sam(bgr: np.ndarray, init_bbox):
         "mask": mask
     }
 
+def create_edge_assist_image(bgr: np.ndarray):
+    # 하이라이트 제거
+    bgr_no_glare = reduce_specular_glare(bgr)
+    
+    gray = cv2.cvtColor(bgr_no_glare, cv2.COLOR_BGR2GRAY)
+    clahe = cv2.createCLAHE(clipLimit=2.0, tileGridSize=(8, 8))
+    enhanced = clahe.apply(gray)
+    
+    edges = cv2.Canny(enhanced, 40, 140)
+    kernel = np.ones((3, 3), np.uint8)
+    edges = cv2.dilate(edges, kernel, iterations=1)
+    
+    assist = cv2.cvtColor(gray, cv2.COLOR_GRAY2BGR)
+    assist[edges > 0] = (255, 255, 255)
+    
+    return assist, edges, enhanced
+
 # -----------------------------
 # 디버그 저장
 # -----------------------------
@@ -376,19 +414,20 @@ def save_debug_bundle(index: int,
                       refined_bbox,
                       gemini_text: str | None,
                       sam_mask: np.ndarray | None):
+    import cv2  # OpenCV를 함수 내부에서만 사용
     os.makedirs(DEBUG_DIR, exist_ok=True)
 
     base = safe_filename(url)
     prefix = f"{index:03d}_{base}"
 
-    cv2.imwrite(os.path.join(DEBUG_DIR, f"{prefix}_orig.png"), bgr)
+    # cv2.imwrite(os.path.join(DEBUG_DIR, f"{prefix}_orig.png"), bgr)
 
     bgr_no_glare = reduce_specular_glare(bgr)
-    cv2.imwrite(os.path.join(DEBUG_DIR, f"{prefix}_no_glare.png"), bgr_no_glare)
+    # cv2.imwrite(os.path.join(DEBUG_DIR, f"{prefix}_no_glare.png"), bgr_no_glare)
 
-    cv2.imwrite(os.path.join(DEBUG_DIR, f"{prefix}_assist.png"), assist)
-    cv2.imwrite(os.path.join(DEBUG_DIR, f"{prefix}_enhanced_gray.png"), enhanced_gray)
-    cv2.imwrite(os.path.join(DEBUG_DIR, f"{prefix}_edges.png"), edges)
+    # cv2.imwrite(os.path.join(DEBUG_DIR, f"{prefix}_assist.png"), assist)
+    # cv2.imwrite(os.path.join(DEBUG_DIR, f"{prefix}_enhanced_gray.png"), enhanced_gray)
+    # cv2.imwrite(os.path.join(DEBUG_DIR, f"{prefix}_edges.png"), edges)
 
     overlay = bgr.copy()
 
@@ -404,15 +443,15 @@ def save_debug_bundle(index: int,
         cv2.putText(overlay, "sam", (x1, max(0, y1 - 10)),
                     cv2.FONT_HERSHEY_SIMPLEX, 0.8, (0, 255, 0), 2, cv2.LINE_AA)
 
-    cv2.imwrite(os.path.join(DEBUG_DIR, f"{prefix}_overlay.png"), overlay)
+    # cv2.imwrite(os.path.join(DEBUG_DIR, f"{prefix}_overlay.png"), overlay)
 
     if sam_mask is not None:
-        cv2.imwrite(os.path.join(DEBUG_DIR, f"{prefix}_sam_mask.png"), (sam_mask * 255).astype(np.uint8))
+        # cv2.imwrite(os.path.join(DEBUG_DIR, f"{prefix}_sam_mask.png"), (sam_mask * 255).astype(np.uint8))
 
         mask_overlay = bgr.copy()
         m = sam_mask.astype(bool)
         mask_overlay[m] = cv2.addWeighted(mask_overlay[m], 0.3, np.full_like(mask_overlay[m], 255), 0.7, 0)
-        cv2.imwrite(os.path.join(DEBUG_DIR, f"{prefix}_sam_overlay.png"), mask_overlay)
+        # cv2.imwrite(os.path.join(DEBUG_DIR, f"{prefix}_sam_overlay.png"), mask_overlay)
 
     if gemini_text:
         with open(os.path.join(DEBUG_DIR, f"{prefix}_gemini_response.txt"), "w", encoding="utf-8") as f:
@@ -422,6 +461,7 @@ def save_debug_bundle(index: int,
 # 메인 엔트리
 # -----------------------------
 def crop_labels(image: np.ndarray, data_url: str, index: int, debug: bool = True):
+    import cv2  # OpenCV를 함수 내부에서만 사용
     if image is None or not hasattr(image, "shape"):
         raise ValueError("image must be a valid OpenCV image (numpy array).")
 
@@ -430,8 +470,14 @@ def crop_labels(image: np.ndarray, data_url: str, index: int, debug: bool = True
 
     out_idx = index + 1
 
+    # 이미지 전처리: 배경 제거 및 대비 조정
+    preprocessed_image = preprocess_image(image)
+
+    # 엣지 보조 이미지 생성
+    assist_image, edges, enhanced_gray = create_edge_assist_image(preprocessed_image)
+
     # Gemini AI로부터 bbox를 찾기
-    gemini_bbox, info = detect_bbox_with_gemini(image, image, data_url)  # glare 및 assist 이미지 없이 사용
+    gemini_bbox, info = detect_bbox_with_gemini(preprocessed_image, assist_image, data_url)
     gemini_text = info.get("response") if isinstance(info, dict) else None
 
     if gemini_bbox is None:
@@ -442,14 +488,14 @@ def crop_labels(image: np.ndarray, data_url: str, index: int, debug: bool = True
 
     # 패딩을 추가하여 bounding box 확장
     x1, y1, x2, y2 = gemini_bbox
-    x1, y1, x2, y2 = clamp_bbox(x1 - padding, y1 - padding, x2 + padding, y2 + padding, image.shape[1], image.shape[0])
+    x1, y1, x2, y2 = clamp_bbox(x1 - padding, y1 - padding, x2 + padding, y2 + padding, preprocessed_image.shape[1], preprocessed_image.shape[0])
 
     # SAM refine
     refined_bbox = None
     sam_mask = None
 
     if USE_SAM:
-        rb, sam_info = refine_bbox_with_sam(image, (x1, y1, x2, y2))
+        rb, sam_info = refine_bbox_with_sam(preprocessed_image, (x1, y1, x2, y2))
         if rb is not None:
             refined_bbox = rb
         if isinstance(sam_info, dict) and sam_info.get("mask") is not None:
@@ -457,9 +503,9 @@ def crop_labels(image: np.ndarray, data_url: str, index: int, debug: bool = True
 
     # 초기 크롭 박스 설정 
     final_bbox = refined_bbox if refined_bbox is not None else (x1, y1, x2, y2)
-    pad = int(min(image.shape[:2]) * 0.3)  # 여유
+    pad = int(min(preprocessed_image.shape[:2]) * 0.3)  # 여유
     x1, y1, x2, y2 = final_bbox
-    x1, y1, x2, y2 = clamp_bbox(x1, y1, x2, y2, image.shape[1], image.shape[0], pad=pad)
+    x1, y1, x2, y2 = clamp_bbox(x1, y1, x2, y2, preprocessed_image.shape[1], preprocessed_image.shape[0], pad=pad)
 
     # 크롭 및 저장
     crop = image[y1:y2, x1:x2].copy()
@@ -473,9 +519,9 @@ def crop_labels(image: np.ndarray, data_url: str, index: int, debug: bool = True
     # 세밀한 조정을 위해 반복
     for i in range(2):  # 2회 반복하여 크롭 범위를 줄임
         # 여유를 줄여서 새로운 크롭 박스 설정
-        pad = int(min(image.shape[:2]) * 0.0)  # 여유를 5%로 설정
+        pad = int(min(preprocessed_image.shape[:2]) * 0.01)  # 여유를 0%로 설정
         x1, y1, x2, y2 = final_bbox
-        x1, y1, x2, y2 = clamp_bbox(x1, y1, x2, y2, image.shape[1], image.shape[0], pad=pad)
+        x1, y1, x2, y2 = clamp_bbox(x1, y1, x2, y2, preprocessed_image.shape[1], preprocessed_image.shape[0], pad=pad)
 
         crop = image[y1:y2, x1:x2].copy()
         out_path = os.path.join(OUT_DIR, OUT_LABEL_TEMPLATE.format(out_idx))
@@ -487,6 +533,6 @@ def crop_labels(image: np.ndarray, data_url: str, index: int, debug: bool = True
         print(f"[{out_idx:03d}] Failed to save refined label crop.")
 
     if debug:
-        save_debug_bundle(index=out_idx, bgr=image, assist=None, enhanced_gray=None,
-                          edges=None, url=data_url, gemini_bbox=gemini_bbox,
+        save_debug_bundle(index=out_idx, bgr=image, assist=assist_image, enhanced_gray=enhanced_gray,
+                          edges=edges, url=data_url, gemini_bbox=gemini_bbox,
                           refined_bbox=refined_bbox, gemini_text=gemini_text, sam_mask=sam_mask)
