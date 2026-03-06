@@ -4,7 +4,7 @@ import json
 import base64
 import numpy as np
 import cv2
-
+import boto3
 # -----------------------------
 # 환경 설정
 # -----------------------------
@@ -137,16 +137,31 @@ def score_label_mask(mask: np.ndarray, w: int, h: int) -> float:
     ar = bw / float(bh + 1e-6)
     ar_pen = 1.0 if (0.35 <= ar <= 3.2) else 0.5
 
-    # 중앙, 상단, 하단 각각의 점수 계산
-    top_score = max(0, (0.5 * h - y1) / (0.5 * h))  # 상단 영역
-    middle_score = max(0, 1 - abs((y1 + bh / 2) - (h / 2)) / (0.25 * h))  # 중앙 영역
-    bottom_score = max(0, (y2 - 0.5 * h) / (0.5 * h))  # 하단 영역
+    # 10부분으로 나누기 (세로)
+    section_height = h / 8
+    vertical_scores = []
+
+    for i in range(8):
+        section_y1 = int(i * section_height)
+        section_y2 = int((i + 1) * section_height)
+
+        # 하단 영역의 점수를 낮추기 위한 조건 추가
+        if i == 7:  # 8th 부분 (하단)
+            score = max(0, (0.5 * h - y1) / (0.5 * h)) * 0.5  # 점수를 절반으로 줄임
+        elif i == 0:  # 1st 부분 (상단)
+            score = max(0, (0.5 * h - y1) / (0.5 * h))
+        else:  # 중앙 영역
+            score = max(0, 1 - abs((y1 + bh / 2) - (section_y1 + section_height / 2)) / (0.5 * section_height))
+        
+        vertical_scores.append(score)
+
+    position_score_vertical = sum(vertical_scores) / len(vertical_scores)
 
     # 최종 점수 계산
-    position_score = (top_score + middle_score + bottom_score) / 3
+    final_position_score = position_score_vertical
 
-    return (2.0 * fill + 0.6 * position_score) * ar_pen
-
+    return (2.0 * fill + 0.6 * final_position_score) * ar_pen
+    
 # -----------------------------
 # Edge assist image 생성
 # -----------------------------
@@ -253,6 +268,7 @@ def detect_bbox_with_gemini(color_bgr: np.ndarray, assist_bgr: np.ndarray, origi
     당신은 이미지 내의 라벨(Label)을 찾는 전문가입니다.
     제공된 컬러 이미지와 엣지(Edge) 보조 이미지를 참고하여, 물체 정면에 붙은 '라벨'의 좌표를 찾으세요.
     하이라이트(반사광)를 무시하고 라벨만 인식하세요
+    워터마크(vivino)를 무시하고 라벨을 인식하십시오
     반드시 다음 JSON 형식으로만 답변하세요:
     {{
       "label_bboxes": [{{"x1": int, "y1": int, "x2": int, "y2": int}}],
@@ -427,43 +443,30 @@ def save_debug_bundle(index: int,
     base = safe_filename(url)
     prefix = f"{index:03d}_{base}"
 
-    # cv2.imwrite(os.path.join(DEBUG_DIR, f"{prefix}_orig.png"), bgr)
-
-    bgr_no_glare = reduce_specular_glare(bgr)
-    # cv2.imwrite(os.path.join(DEBUG_DIR, f"{prefix}_no_glare.png"), bgr_no_glare)
-
-    # cv2.imwrite(os.path.join(DEBUG_DIR, f"{prefix}_assist.png"), assist)
-    # cv2.imwrite(os.path.join(DEBUG_DIR, f"{prefix}_enhanced_gray.png"), enhanced_gray)
-    # cv2.imwrite(os.path.join(DEBUG_DIR, f"{prefix}_edges.png"), edges)
-
+    # 원본 이미지에 경계 상자 그리기
     overlay = bgr.copy()
-
+    
     if gemini_bbox is not None:
         x1, y1, x2, y2 = gemini_bbox
-        cv2.rectangle(overlay, (x1, y1), (x2, y2), (0, 255, 255), 3)
-        cv2.putText(overlay, "gemini", (x1, max(0, y1 - 10)),
+        cv2.rectangle(overlay, (x1, y1), (x2, y2), (0, 255, 255), 3)  # 노란색 경계
+        cv2.putText(overlay, "Gemini", (x1, max(0, y1 - 10)),
                     cv2.FONT_HERSHEY_SIMPLEX, 0.8, (0, 255, 255), 2, cv2.LINE_AA)
 
     if refined_bbox is not None:
         x1, y1, x2, y2 = refined_bbox
-        cv2.rectangle(overlay, (x1, y1), (x2, y2), (0, 255, 0), 3)
-        cv2.putText(overlay, "sam", (x1, max(0, y1 - 10)),
+        cv2.rectangle(overlay, (x1, y1), (x2, y2), (0, 255, 0), 3)  # 초록색 경계
+        cv2.putText(overlay, "SAM", (x1, max(0, y1 - 10)),
                     cv2.FONT_HERSHEY_SIMPLEX, 0.8, (0, 255, 0), 2, cv2.LINE_AA)
 
-    # cv2.imwrite(os.path.join(DEBUG_DIR, f"{prefix}_overlay.png"), overlay)
+    cv2.imwrite(os.path.join(DEBUG_DIR, f"{prefix}_overlay.png"), overlay)  # 오버레이된 이미지 저장
 
+    # 나머지 디버그 정보 저장
     if sam_mask is not None:
-        # cv2.imwrite(os.path.join(DEBUG_DIR, f"{prefix}_sam_mask.png"), (sam_mask * 255).astype(np.uint8))
-
-        mask_overlay = bgr.copy()
-        m = sam_mask.astype(bool)
-        mask_overlay[m] = cv2.addWeighted(mask_overlay[m], 0.3, np.full_like(mask_overlay[m], 255), 0.7, 0)
-        # cv2.imwrite(os.path.join(DEBUG_DIR, f"{prefix}_sam_overlay.png"), mask_overlay)
+        cv2.imwrite(os.path.join(DEBUG_DIR, f"{prefix}_sam_mask.png"), (sam_mask * 255).astype(np.uint8))
 
     if gemini_text:
         with open(os.path.join(DEBUG_DIR, f"{prefix}_gemini_response.txt"), "w", encoding="utf-8") as f:
             f.write(gemini_text)
-
 # -----------------------------
 # 메인 엔트리
 # -----------------------------
@@ -491,7 +494,7 @@ def crop_labels(image: np.ndarray, data_url: str, index: int, debug: bool = True
         print(f"[{out_idx:03d}] ❌ Gemini bbox not found")
         return
     
-    padding = 10
+    padding = 20
 
     # 패딩을 추가하여 bounding box 확장
     x1, y1, x2, y2 = gemini_bbox
@@ -526,7 +529,7 @@ def crop_labels(image: np.ndarray, data_url: str, index: int, debug: bool = True
     # 세밀한 조정을 위해 반복
     for i in range(2):  # 2회 반복하여 크롭 범위를 줄임
         # 여유를 줄여서 새로운 크롭 박스 설정
-        pad = int(min(preprocessed_image.shape[:2]) * 0.01)  # 여유를 0%로 설정
+        pad = int(min(preprocessed_image.shape[:2]) * 0.001)  # 여유를 0%로 설정
         x1, y1, x2, y2 = final_bbox
         x1, y1, x2, y2 = clamp_bbox(x1, y1, x2, y2, preprocessed_image.shape[1], preprocessed_image.shape[0], pad=pad)
 
