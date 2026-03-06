@@ -61,7 +61,7 @@ _sam_predictor = None
 # -----------------------------
 def select_largest_vivino_image(image_data):
     selected_image = None
-    max_area = 0
+    max_area = -1
     selected_key = None
 
     for image_url, s3_key in image_data.items():
@@ -86,7 +86,7 @@ def select_largest_vivino_image(image_data):
 
     return selected_image, selected_key
 
-def fetch_data(limit=5, total_results=5):
+def fetch_data(limit=5, total_results=5, start_row=24):
     connection = None
     try:
         connection = pymysql.connect(
@@ -97,7 +97,7 @@ def fetch_data(limit=5, total_results=5):
             port=3306,
         )
 
-        offset = 0
+        offset = start_row
         fetched_results = 0
 
         while fetched_results < total_results:
@@ -276,7 +276,7 @@ def gemini_refine_bbox(color_bgr: np.ndarray, assist_bgr: np.ndarray, candidate_
             time.sleep(1.2)
             
             resp = _gemini_client.models.generate_content(
-                model="gemini-2.0-flash", 
+                model="gemini-3-flash-preview", 
                 contents=[
                     instruction,
                     Image.fromarray(cv2.cvtColor(color_bgr, cv2.COLOR_BGR2RGB)),
@@ -478,7 +478,7 @@ if __name__ == "__main__":
     print("[DEBUG] Google Generative AI:", "ON" if _gemini_client else "OFF")
     print("[DEBUG] SAM:", "ON" if (USE_SAM and _sam_available and os.path.exists(SAM_CHECKPOINT)) else "OFF")
 
-    for i, (img_cv, url) in enumerate(fetch_data(limit=5, total_results=5), start=1):
+    for i, (img_cv, url) in enumerate(fetch_data(limit=1, total_results=10), start=1):
         final_bbox, dbg = detect_label_edges_gemini_sam(img_cv, url)
 
         # 디버그 항상 저장
