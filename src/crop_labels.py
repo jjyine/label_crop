@@ -113,10 +113,18 @@ def preprocess_image(image: np.ndarray) -> np.ndarray:
     beta = 30    # 밝기
     adjusted_image = cv2.convertScaleAbs(image, alpha=alpha, beta=beta)
 
-    # 배경 흐리게 (노이즈 제거)
-    blurred_image = cv2.GaussianBlur(adjusted_image, (5, 5), 0)
+    # CLAHE 적용
+    gray = cv2.cvtColor(adjusted_image, cv2.COLOR_BGR2GRAY)
+    clahe = cv2.createCLAHE(clipLimit=2.0, tileGridSize=(8, 8))
+    clahe_image = clahe.apply(gray)
 
-    return blurred_image
+    # 배경 흐리게 (노이즈 제거)
+    blurred_image = cv2.GaussianBlur(clahe_image, (5, 5), 0)
+
+    # BGR 이미지로 다시 변환
+    bgr_image = cv2.cvtColor(blurred_image, cv2.COLOR_GRAY2BGR)
+
+    return bgr_image
 
 # -----------------------------
 # SAM 멀티마스크 중 "라벨다운" 마스크 선택을 위한 스코어링
@@ -137,25 +145,33 @@ def score_label_mask(mask: np.ndarray, w: int, h: int) -> float:
     ar = bw / float(bh + 1e-6)
     ar_pen = 1.0 if (0.35 <= ar <= 3.2) else 0.5
 
-    # 10부분으로 나누기 (세로)
-    section_height = h / 8
+    # 40부분으로 나누기 (세로)
+    section_height = h / 40
     vertical_scores = []
 
-    for i in range(8):
+    for i in range(40):
         section_y1 = int(i * section_height)
         section_y2 = int((i + 1) * section_height)
 
-        # 하단 영역의 점수를 낮추기 위한 조건 추가
-        if i == 7:  # 8th 부분 (하단)
-            score = max(0, (0.5 * h - y1) / (0.5 * h)) * 0.5  # 점수를 절반으로 줄임
-        elif i == 0:  # 1st 부분 (상단)
-            score = max(0, (0.5 * h - y1) / (0.5 * h))
-        else:  # 중앙 영역
-            score = max(0, 1 - abs((y1 + bh / 2) - (section_y1 + section_height / 2)) / (0.5 * section_height))
-        
+        # 섹션의 마스크 생성
+        section_mask = mask[section_y1:section_y2, :]
+        section_area = float(section_mask.sum())
+
+        # 섹션의 점수 계산
+        if section_area > 0:  # 섹션에 물체가 있는 경우
+            score = section_area / (section_height * w)  # 섹션의 비율 기반 점수 계산
+
+            # 하단 2영역의 점수를 낮추기
+            if i >= 38:  # 하단 2개 섹션
+                score = -1  # 점수를 0으로 설정
+        else:
+            score = 0  # 섹션에 물체가 없는 경우 점수는 0
+
         vertical_scores.append(score)
 
-    position_score_vertical = sum(vertical_scores) / len(vertical_scores)
+    # 하단 두 섹션을 제외한 평균 점수 계산
+    valid_scores = [score for score in vertical_scores if score > 0]  # 0보다 큰 점수만 필터링
+    position_score_vertical = sum(valid_scores) / len(valid_scores) if valid_scores else 0
 
     # 최종 점수 계산
     final_position_score = position_score_vertical
@@ -166,16 +182,25 @@ def score_label_mask(mask: np.ndarray, w: int, h: int) -> float:
 # Edge assist image 생성
 # -----------------------------
 def create_edge_assist_image(bgr: np.ndarray):
-    import cv2  # OpenCV를 함수 내부에서만 사용
+    # 하이라이트 제거
     bgr_no_glare = reduce_specular_glare(bgr)
+    
+    # CLAHE를 사용하여 대비 조정
     gray = cv2.cvtColor(bgr_no_glare, cv2.COLOR_BGR2GRAY)
-    clahe = cv2.createCLAHE(clipLimit=2.0, tileGridSize=(8, 8))
+    clahe = cv2.createCLAHE(clipLimit=3.0, tileGridSize=(10, 10))  # clipLimit 조정
     enhanced = clahe.apply(gray)
-    edges = cv2.Canny(enhanced, 40, 140)
+    
+    # Canny 엣지 검출 매개변수 조정
+    edges = cv2.Canny(enhanced, 200, 400)  # 임계값 조정
     kernel = np.ones((3, 3), np.uint8)
-    edges = cv2.dilate(edges, kernel, iterations=1)
+    
+    # 모폴로지 연산 추가
+    edges = cv2.morphologyEx(edges, cv2.MORPH_CLOSE, kernel, iterations=1)  # 닫기 연산
+    edges = cv2.dilate(edges, kernel, iterations=1)  # 팽창
+    
     assist = cv2.cvtColor(gray, cv2.COLOR_GRAY2BGR)
     assist[edges > 0] = (255, 255, 255)
+    
     return assist, edges, enhanced
 
 def find_label_roi_from_edges(edges: np.ndarray, image_shape, debug: bool = False):
@@ -372,6 +397,8 @@ def refine_bbox_with_sam(bgr: np.ndarray, init_bbox):
 
     best_idx = None
     best_val = -1e9
+
+    # 1) 점수 계산은 기존 방식 유지
     for i in range(masks.shape[0]):
         m = masks[i].astype(np.uint8)
         val = float(scores[i]) + 0.8 * score_label_mask(m, w, h)
@@ -382,22 +409,34 @@ def refine_bbox_with_sam(bgr: np.ndarray, init_bbox):
     if best_idx is None:
         return None, {"reason": "sam_no_valid_mask", "scores": scores.tolist()}
 
-    mask = masks[best_idx].astype(np.uint8)
+    # 2) 선택된 mask만 가져옴
+    mask = masks[best_idx].astype(np.uint8).copy()
 
+    # 3) 하단 영역만 잘라냄
+    section_height = h / 40
+    cutoff_section = 37   # 37, 38, 39 섹션 제거
+    cutoff_y = int(cutoff_section * section_height)
+    mask[cutoff_y:, :] = 0
+
+    # 4) 잘라낸 뒤 비었는지 확인
     ys, xs = np.where(mask > 0)
     if len(xs) == 0 or len(ys) == 0:
         return None, {
-            "reason": "sam_empty_mask",
+            "reason": "sam_empty_mask_after_cutoff",
             "scores": scores.tolist(),
             "best_idx": int(best_idx),
             "best_val": float(best_val),
             "mask": mask
         }
 
+    # 5) 잘라낸 mask로 bbox 계산
     rx1, rx2 = int(xs.min()), int(xs.max())
     ry1, ry2 = int(ys.min()), int(ys.max())
 
-    rx1, ry1, rx2, ry2 = clamp_bbox(rx1, ry1, rx2, ry2, w, h, pad=int(min(w, h) * 0.005))
+    rx1, ry1, rx2, ry2 = clamp_bbox(
+        rx1, ry1, rx2, ry2, w, h,
+        pad=int(min(w, h) * 0.005)
+    )
     refined_bbox = (rx1, ry1, rx2, ry2)
 
     return refined_bbox, {
@@ -432,6 +471,7 @@ def save_debug_bundle(index: int,
                       assist: np.ndarray,
                       enhanced_gray: np.ndarray,
                       edges: np.ndarray,
+                      clahe_image: np.ndarray,
                       url: str,
                       gemini_bbox,
                       refined_bbox,
@@ -458,7 +498,11 @@ def save_debug_bundle(index: int,
         cv2.putText(overlay, "SAM", (x1, max(0, y1 - 10)),
                     cv2.FONT_HERSHEY_SIMPLEX, 0.8, (0, 255, 0), 2, cv2.LINE_AA)
 
+    # 디버그 이미지 저장
     cv2.imwrite(os.path.join(DEBUG_DIR, f"{prefix}_overlay.png"), overlay)  # 오버레이된 이미지 저장
+    cv2.imwrite(os.path.join(DEBUG_DIR, f"{prefix}_clahe.png"), clahe_image)  # CLAHE 적용된 이미지 저장
+    cv2.imwrite(os.path.join(DEBUG_DIR, f"{prefix}_assist.png"), assist)  # 엣지 보조 이미지 저장
+    cv2.imwrite(os.path.join(DEBUG_DIR, f"{prefix}_edges.png"), edges)  # 엣지 이미지 저장
 
     # 나머지 디버그 정보 저장
     if sam_mask is not None:
@@ -467,6 +511,7 @@ def save_debug_bundle(index: int,
     if gemini_text:
         with open(os.path.join(DEBUG_DIR, f"{prefix}_gemini_response.txt"), "w", encoding="utf-8") as f:
             f.write(gemini_text)
+
 # -----------------------------
 # 메인 엔트리
 # -----------------------------
@@ -483,6 +528,10 @@ def crop_labels(image: np.ndarray, data_url: str, index: int, debug: bool = True
     # 이미지 전처리: 배경 제거 및 대비 조정
     preprocessed_image = preprocess_image(image)
 
+    # CLAHE 이미지 저장 (디버깅)
+    clahe_image = cv2.cvtColor(preprocessed_image, cv2.COLOR_BGR2GRAY)
+    debug_clahe_image = cv2.cvtColor(clahe_image, cv2.COLOR_GRAY2BGR)
+
     # 엣지 보조 이미지 생성
     assist_image, edges, enhanced_gray = create_edge_assist_image(preprocessed_image)
 
@@ -494,15 +543,16 @@ def crop_labels(image: np.ndarray, data_url: str, index: int, debug: bool = True
         print(f"[{out_idx:03d}] ❌ Gemini bbox not found")
         return
     
-    padding = 20
+    padding = 0
 
     # 패딩을 추가하여 bounding box 확장
     x1, y1, x2, y2 = gemini_bbox
-    x1, y1, x2, y2 = clamp_bbox(x1 - padding, y1 - padding, x2 + padding, y2 + padding, preprocessed_image.shape[1], preprocessed_image.shape[0])
+    x1, y1, x2, y2 = clamp_bbox(x1, y1, x2, y2 + padding, preprocessed_image.shape[1], preprocessed_image.shape[0])
 
     # SAM refine
     refined_bbox = None
     sam_mask = None
+    section_scores = []
 
     if USE_SAM:
         rb, sam_info = refine_bbox_with_sam(preprocessed_image, (x1, y1, x2, y2))
@@ -511,9 +561,40 @@ def crop_labels(image: np.ndarray, data_url: str, index: int, debug: bool = True
         if isinstance(sam_info, dict) and sam_info.get("mask") is not None:
             sam_mask = sam_info["mask"]
 
+            scores = []
+            section_height = preprocessed_image.shape[0] / 40
+
+            for i in range(40):
+                if i >= 37:
+                    score = -1e9
+                else:
+                    section_mask = np.zeros_like(sam_mask)
+                    y1 = int(i * section_height)
+                    y2 = int((i + 1) * section_height)
+                    section_mask[y1:y2, :] = sam_mask[y1:y2, :]
+                    score = score_label_mask(section_mask, preprocessed_image.shape[1], preprocessed_image.shape[0])
+                
+                scores.append(score)
+
+            # 평균 점수 계산
+            average_score = sum(scores) / len(scores)
+            print(f"[{out_idx:03d}] 평균 점수: {average_score:.2f}, 섹션 점수: {scores}")
+
+            # 디버깅 이미지에 각 섹션 그리기
+            if debug:
+                debug_image = image.copy()  # 디버깅 이미지를 위한 복사본 생성
+                for i, score in enumerate(scores):
+                    section_y1 = int(i * section_height)
+                    section_y2 = int((i + 1) * section_height)
+                    cv2.rectangle(debug_image, (0, section_y1), (preprocessed_image.shape[1], section_y2), (0, 255, 0), 1)  # 섹션 경계 그리기
+                    cv2.putText(debug_image, f'Score: {score:.2f}', (10, section_y1 + 20), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 255, 0), 1)
+
+                # 디버깅 이미지 저장
+                cv2.imwrite(os.path.join(DEBUG_DIR, f"{out_idx:03d}_section_scores.png"), debug_image)
+
     # 초기 크롭 박스 설정 
     final_bbox = refined_bbox if refined_bbox is not None else (x1, y1, x2, y2)
-    pad = int(min(preprocessed_image.shape[:2]) * 0.3)  # 여유
+    pad = int(min(preprocessed_image.shape[:2]) * 0.0)  # 여유
     x1, y1, x2, y2 = final_bbox
     x1, y1, x2, y2 = clamp_bbox(x1, y1, x2, y2, preprocessed_image.shape[1], preprocessed_image.shape[0], pad=pad)
 
@@ -528,7 +609,6 @@ def crop_labels(image: np.ndarray, data_url: str, index: int, debug: bool = True
 
     # 세밀한 조정을 위해 반복
     for i in range(2):  # 2회 반복하여 크롭 범위를 줄임
-        # 여유를 줄여서 새로운 크롭 박스 설정
         pad = int(min(preprocessed_image.shape[:2]) * 0.001)  # 여유를 0%로 설정
         x1, y1, x2, y2 = final_bbox
         x1, y1, x2, y2 = clamp_bbox(x1, y1, x2, y2, preprocessed_image.shape[1], preprocessed_image.shape[0], pad=pad)
@@ -543,6 +623,8 @@ def crop_labels(image: np.ndarray, data_url: str, index: int, debug: bool = True
         print(f"[{out_idx:03d}] Failed to save refined label crop.")
 
     if debug:
+        # 디버그 이미지 저장
         save_debug_bundle(index=out_idx, bgr=image, assist=assist_image, enhanced_gray=enhanced_gray,
-                          edges=edges, url=data_url, gemini_bbox=gemini_bbox,
-                          refined_bbox=refined_bbox, gemini_text=gemini_text, sam_mask=sam_mask)
+                          edges=edges, clahe_image=debug_clahe_image, url=data_url, 
+                          gemini_bbox=gemini_bbox, refined_bbox=refined_bbox, 
+                          gemini_text=gemini_text, sam_mask=sam_mask)
