@@ -107,25 +107,7 @@ def reduce_specular_glare(bgr: np.ndarray) -> np.ndarray:
 # 이미지 전처리: 대비 조정 및 배경 제거
 # -----------------------------
 def preprocess_image(image: np.ndarray) -> np.ndarray:
-    import cv2
-
-    # 1. glare만 제거
-    img = reduce_specular_glare(image)
-
-    # 2. bilateral filter (edge 보존)
-    # img = cv2.bilateralFilter(img, 5, 40, 40)
-
-    # 3. LAB 색공간에서 contrast만 강화
-    lab = cv2.cvtColor(img, cv2.COLOR_BGR2LAB)
-    l, a, b = cv2.split(lab)
-
-    clahe = cv2.createCLAHE(clipLimit=1.5, tileGridSize=(8,8))
-    l = clahe.apply(l)
-
-    lab = cv2.merge((l,a,b))
-    img = cv2.cvtColor(lab, cv2.COLOR_LAB2BGR)
-
-    return img
+    return image.copy()
 
 # -----------------------------
 # SAM 멀티마스크 중 "라벨다운" 마스크 선택을 위한 스코어링
@@ -183,37 +165,28 @@ def score_label_mask(mask: np.ndarray, w: int, h: int) -> float:
 # Edge assist image 생성
 # -----------------------------
 def create_edge_assist_image(bgr: np.ndarray):
-    # 하이라이트 제거
-    bgr_no_glare = reduce_specular_glare(bgr)
-    
-    # CLAHE를 사용하여 대비 조정
-    gray = cv2.cvtColor(bgr_no_glare, cv2.COLOR_BGR2GRAY)
-    clahe = cv2.createCLAHE(clipLimit=1.5, tileGridSize=(8, 8))  # clipLimit 조정
-    enhanced = clahe.apply(gray)
-    
-    # Canny 엣지 검출 매개변수 조정
-    edges = cv2.Canny(enhanced, 80, 160)  # 임계값 조정
-    kernel = np.ones((3, 3), np.uint8)
-    
-    # 모폴로지 연산 추가
-    edges = cv2.morphologyEx(edges, cv2.MORPH_CLOSE, kernel, iterations=1)  # 닫기 연산
-    
+    gray = cv2.cvtColor(bgr, cv2.COLOR_BGR2GRAY)
+
+    # CLAHE, glare 제거, morphology 제거
+    edges = cv2.Canny(gray, 80, 160)
+
     assist = cv2.cvtColor(gray, cv2.COLOR_GRAY2BGR)
     assist[edges > 0] = (255, 255, 255)
-    
-    return assist, edges, enhanced
+
+    return assist, edges, gray
 
 def find_label_roi_from_edges(edges: np.ndarray, image_shape, debug: bool = False):
-    import cv2  # OpenCV를 함수 내부에서만 사용
+    import cv2
     h, w = image_shape[:2]
     e = edges.copy()
+
     if e.dtype != np.uint8:
         e = e.astype(np.uint8)
     if e.max() == 1:
         e = (e * 255).astype(np.uint8)
 
-    kernel = np.ones((5, 5), np.uint8)
-    e2 = cv2.morphologyEx(e, cv2.MORPH_CLOSE, kernel, iterations=1)
+    # morphology 제거
+    e2 = e
 
     contours, _ = cv2.findContours(e2, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
     if not contours:
@@ -447,9 +420,9 @@ def refine_bbox_with_sam(bgr: np.ndarray, init_bbox):
 
 def create_edge_assist_image(bgr: np.ndarray):
     # 하이라이트 제거
-    bgr_no_glare = reduce_specular_glare(bgr)
+    # bgr_no_glare = reduce_specular_glare(bgr)
     
-    gray = cv2.cvtColor(bgr_no_glare, cv2.COLOR_BGR2GRAY)
+    gray = cv2.cvtColor(bgr, cv2.COLOR_BGR2GRAY)
     clahe = cv2.createCLAHE(clipLimit=1.5, tileGridSize=(8, 8))
     enhanced = clahe.apply(gray)
     
