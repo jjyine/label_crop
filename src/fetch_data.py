@@ -86,7 +86,7 @@ def select_largest_vivino_image(image_data):
 
     return selected_image, selected_key
 
-def fetch_data(limit=5, total_results=5, start_row=24):
+def fetch_data(limit=5, total_results=5, start_row=0):
     connection = None
     try:
         connection = pymysql.connect(
@@ -191,8 +191,10 @@ def find_label_candidate_box_from_edges(edges: np.ndarray):
     h, w = edges.shape[:2]
 
     work = edges.copy()
-    work = cv2.morphologyEx(work, cv2.MORPH_CLOSE, np.ones((9, 9), np.uint8), iterations=2)
-    work = cv2.dilate(work, np.ones((7, 7), np.uint8), iterations=1)
+    work = cv2.morphologyEx(edges,
+                        cv2.MORPH_CLOSE,
+                        np.ones((3,3), np.uint8),
+                        iterations=1)
 
     contours, _ = cv2.findContours(work, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
 

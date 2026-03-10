@@ -96,7 +96,7 @@ def encode_bgr_to_data_url_png(bgr: np.ndarray) -> str:
 def reduce_specular_glare(bgr: np.ndarray) -> np.ndarray:
     import cv2  # OpenCV를 함수 내부에서만 사용
     hsv = cv2.cvtColor(bgr, cv2.COLOR_BGR2HSV)
-    glare = cv2.inRange(hsv, (0, 0, 210), (180, 60, 255))
+    glare = cv2.inRange(hsv, (0, 0, 230), (180, 40, 255))
     k = np.ones((5, 5), np.uint8)
     glare = cv2.morphologyEx(glare, cv2.MORPH_OPEN, k, iterations=1)
     glare = cv2.dilate(glare, k, iterations=1)
@@ -107,24 +107,25 @@ def reduce_specular_glare(bgr: np.ndarray) -> np.ndarray:
 # 이미지 전처리: 대비 조정 및 배경 제거
 # -----------------------------
 def preprocess_image(image: np.ndarray) -> np.ndarray:
-    import cv2  # OpenCV를 함수 내부에서만 사용
-    # 대비 조정
-    alpha = 1.5  # 대비
-    beta = 30    # 밝기
-    adjusted_image = cv2.convertScaleAbs(image, alpha=alpha, beta=beta)
+    import cv2
 
-    # CLAHE 적용
-    gray = cv2.cvtColor(adjusted_image, cv2.COLOR_BGR2GRAY)
-    clahe = cv2.createCLAHE(clipLimit=2.0, tileGridSize=(8, 8))
-    clahe_image = clahe.apply(gray)
+    # 1. glare만 제거
+    img = reduce_specular_glare(image)
 
-    # 배경 흐리게 (노이즈 제거)
-    blurred_image = cv2.GaussianBlur(clahe_image, (5, 5), 0)
+    # 2. bilateral filter (edge 보존)
+    # img = cv2.bilateralFilter(img, 5, 40, 40)
 
-    # BGR 이미지로 다시 변환
-    bgr_image = cv2.cvtColor(blurred_image, cv2.COLOR_GRAY2BGR)
+    # 3. LAB 색공간에서 contrast만 강화
+    lab = cv2.cvtColor(img, cv2.COLOR_BGR2LAB)
+    l, a, b = cv2.split(lab)
 
-    return bgr_image
+    clahe = cv2.createCLAHE(clipLimit=1.5, tileGridSize=(8,8))
+    l = clahe.apply(l)
+
+    lab = cv2.merge((l,a,b))
+    img = cv2.cvtColor(lab, cv2.COLOR_LAB2BGR)
+
+    return img
 
 # -----------------------------
 # SAM 멀티마스크 중 "라벨다운" 마스크 선택을 위한 스코어링
@@ -187,16 +188,15 @@ def create_edge_assist_image(bgr: np.ndarray):
     
     # CLAHE를 사용하여 대비 조정
     gray = cv2.cvtColor(bgr_no_glare, cv2.COLOR_BGR2GRAY)
-    clahe = cv2.createCLAHE(clipLimit=3.0, tileGridSize=(10, 10))  # clipLimit 조정
+    clahe = cv2.createCLAHE(clipLimit=1.5, tileGridSize=(8, 8))  # clipLimit 조정
     enhanced = clahe.apply(gray)
     
     # Canny 엣지 검출 매개변수 조정
-    edges = cv2.Canny(enhanced, 200, 400)  # 임계값 조정
+    edges = cv2.Canny(enhanced, 80, 160)  # 임계값 조정
     kernel = np.ones((3, 3), np.uint8)
     
     # 모폴로지 연산 추가
     edges = cv2.morphologyEx(edges, cv2.MORPH_CLOSE, kernel, iterations=1)  # 닫기 연산
-    edges = cv2.dilate(edges, kernel, iterations=1)  # 팽창
     
     assist = cv2.cvtColor(gray, cv2.COLOR_GRAY2BGR)
     assist[edges > 0] = (255, 255, 255)
@@ -214,7 +214,6 @@ def find_label_roi_from_edges(edges: np.ndarray, image_shape, debug: bool = Fals
 
     kernel = np.ones((5, 5), np.uint8)
     e2 = cv2.morphologyEx(e, cv2.MORPH_CLOSE, kernel, iterations=1)
-    e2 = cv2.dilate(e2, kernel, iterations=1)
 
     contours, _ = cv2.findContours(e2, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
     if not contours:
@@ -414,7 +413,7 @@ def refine_bbox_with_sam(bgr: np.ndarray, init_bbox):
 
     # 3) 하단 영역만 잘라냄
     section_height = h / 40
-    cutoff_section = 37   # 37, 38, 39 섹션 제거
+    cutoff_section = 38   # 38, 39 섹션 제거
     cutoff_y = int(cutoff_section * section_height)
     mask[cutoff_y:, :] = 0
 
@@ -451,12 +450,11 @@ def create_edge_assist_image(bgr: np.ndarray):
     bgr_no_glare = reduce_specular_glare(bgr)
     
     gray = cv2.cvtColor(bgr_no_glare, cv2.COLOR_BGR2GRAY)
-    clahe = cv2.createCLAHE(clipLimit=2.0, tileGridSize=(8, 8))
+    clahe = cv2.createCLAHE(clipLimit=1.5, tileGridSize=(8, 8))
     enhanced = clahe.apply(gray)
     
     edges = cv2.Canny(enhanced, 40, 140)
     kernel = np.ones((3, 3), np.uint8)
-    edges = cv2.dilate(edges, kernel, iterations=1)
     
     assist = cv2.cvtColor(gray, cv2.COLOR_GRAY2BGR)
     assist[edges > 0] = (255, 255, 255)
