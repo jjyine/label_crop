@@ -9,6 +9,9 @@ import numpy as np
 from io import BytesIO
 from PIL import Image
 from dotenv import load_dotenv
+import boto3
+from urllib.parse import urlparse
+from botocore.exceptions import BotoCoreError, ClientError
 
 # -----------------------------
 # ENV / 설정
@@ -21,6 +24,12 @@ db_password = os.getenv("DB_PASSWORD")
 db_name = os.getenv("DB_NAME")
 
 GEMINI_API_KEY = os.getenv("GEMINI_API_KEY")
+
+AWS_ACCESS_KEY_ID = os.getenv("AWS_ACCESS_KEY_ID")
+AWS_SECRET_ACCESS_KEY = os.getenv("AWS_SECRET_ACCESS_KEY")
+AWS_REGION = os.getenv("AWS_REGION")
+S3_BUCKET_NAME = os.getenv("S3_BUCKET_NAME")
+S3_LABEL_PREFIX = os.getenv("S3_LABEL_PREFIX")
 
 # SAM
 USE_SAM = os.getenv("USE_SAM", "1") == "1"
@@ -59,34 +68,44 @@ _sam_predictor = None
 # -----------------------------
 # DB 이미지 선택 + fetch
 # -----------------------------
-def select_largest_vivino_image(image_data):
-    selected_image = None
-    max_area = -1
-    selected_key = None
+def extract_image_area(image_url: str) -> int:
+    m = re.search(r"(\d+)x(\d+)", image_url)
+    if m:
+        w, h = int(m.group(1)), int(m.group(2))
+        return w * h
+
+    m = re.search(r"x(\d+)", image_url)
+    if m:
+        size = int(m.group(1))
+        return size * size
+
+    return 0
+
+
+def select_best_image(image_data):
+    vivino_candidates = []
+    other_candidates = []
 
     for image_url, s3_key in image_data.items():
-        if "vivino.com" not in image_url:
-            continue
+        area = extract_image_area(image_url)
+        item = (area, image_url, s3_key)
 
-        area = 0
-        m = re.search(r"(\d+)x(\d+)", image_url)
-        if m:
-            w, h = int(m.group(1)), int(m.group(2))
-            area = w * h
+        if "vivino.com" in image_url:
+            vivino_candidates.append(item)
         else:
-            m = re.search(r"x(\d+)", image_url)
-            if m:
-                size = int(m.group(1))
-                area = size * size
+            other_candidates.append(item)
 
-        if area > max_area:
-            max_area = area
-            selected_image = image_url
-            selected_key = s3_key
+    if vivino_candidates:
+        _, selected_image, selected_key = max(vivino_candidates, key=lambda x: x[0])
+        return selected_image, selected_key
 
-    return selected_image, selected_key
+    if other_candidates:
+        _, selected_image, selected_key = max(other_candidates, key=lambda x: x[0])
+        return selected_image, selected_key
 
-def fetch_data(limit=5, total_results=5, start_row=0):
+    return None, None
+
+def fetch_data(limit=1, total_results=1, start_row=0):
     connection = None
     try:
         connection = pymysql.connect(
@@ -102,7 +121,7 @@ def fetch_data(limit=5, total_results=5, start_row=0):
 
         while fetched_results < total_results:
             with connection.cursor() as cursor:
-                sql = f"SELECT s3_images FROM wine LIMIT {limit} OFFSET {offset};"
+                sql = f"SELECT id, s3_images FROM wine WHERE s3_images IS NOT NULL LIMIT {limit} OFFSET {offset};"
                 cursor.execute(sql)
                 results = cursor.fetchall()
 
@@ -111,10 +130,11 @@ def fetch_data(limit=5, total_results=5, start_row=0):
                     break
 
                 for row in results:
-                    image_data = json.loads(row[0])
-                    vivino_url, selected_key = select_largest_vivino_image(image_data)
+                    wine_id = row[0]
+                    image_data = json.loads(row[1])
+                    selected_url, selected_key = select_best_image(image_data)
 
-                    if vivino_url and selected_key:
+                    if selected_url and selected_key:
                         final_image_url = f"https://vin-social.s3.amazonaws.com/{selected_key}"
                         print("Fetching image from URL:", final_image_url)
 
@@ -125,7 +145,10 @@ def fetch_data(limit=5, total_results=5, start_row=0):
                         img_cv = cv2.cvtColor(np.array(img), cv2.COLOR_RGB2BGR)
 
                         fetched_results += 1
-                        yield img_cv, final_image_url
+                        yield wine_id, img_cv, final_image_url, selected_url
+
+                        if fetched_results >= total_results:
+                            break
 
                 offset += limit
 
@@ -186,6 +209,68 @@ def create_edge_assist_image(bgr: np.ndarray):
     assist[edges > 0] = (255, 255, 255)
 
     return assist, edges, enhanced
+
+def get_s3_client():
+    return boto3.client(
+        "s3",
+        aws_access_key_id=AWS_ACCESS_KEY_ID,
+        aws_secret_access_key=AWS_SECRET_ACCESS_KEY,
+        region_name=AWS_REGION,
+    )
+
+def check_s3_permissions():
+    try:
+        s3 = get_s3_client()
+
+        s3.head_bucket(Bucket=S3_BUCKET_NAME)
+        print(f"[S3] bucket 접근 OK: {S3_BUCKET_NAME}")
+
+        test_key = f"{(S3_LABEL_PREFIX or 'label').strip('/')}/__permission_test__.txt"
+        s3.put_object(
+            Bucket=S3_BUCKET_NAME,
+            Key=test_key,
+            Body=b"permission test",
+            ContentType="text/plain"
+        )
+
+        print(f"[S3] PutObject OK: {test_key}")
+        return True
+
+    except Exception as e:
+        print(f"[S3] 권한 확인 실패: {e}")
+        return False
+
+def extract_filename_from_url(url: str) -> str:
+    path = urlparse(url).path
+    filename = os.path.basename(path)
+    if not filename:
+        raise ValueError(f"파일명을 추출할 수 없습니다: {url}")
+    return filename
+
+def make_label_s3_key(original_url: str) -> str:
+    filename = extract_filename_from_url(original_url)
+    prefix = (S3_LABEL_PREFIX or "label").strip("/")
+    return f"{prefix}/{filename}"
+
+def encode_bgr_to_png_bytes(bgr: np.ndarray) -> bytes:
+    ok, buf = cv2.imencode(".png", bgr)
+    if not ok:
+        raise ValueError("cv2.imencode failed")
+    return buf.tobytes()
+
+def upload_bytes_to_s3(image_bytes: bytes, s3_key: str, content_type: str = "image/png") -> str | None:
+    try:
+        s3 = get_s3_client()
+        s3.put_object(
+            Bucket=S3_BUCKET_NAME,
+            Key=s3_key,
+            Body=image_bytes,
+            ContentType=content_type,
+        )
+        return f"https://{S3_BUCKET_NAME}.s3.{AWS_REGION}.amazonaws.com/{s3_key}"
+    except (BotoCoreError, ClientError, Exception) as e:
+        print(f"[S3] upload failed: {e}")
+        return None
 
 def find_label_candidate_box_from_edges(edges: np.ndarray):
     h, w = edges.shape[:2]
@@ -471,6 +556,27 @@ def detect_label_edges_gemini_sam(bgr: np.ndarray, url: str):
         "sam_mask": sam_mask,
     }
 
+def update_winelabel_crop(wine_id: int, s3_key: str):
+    connection = None
+    try:
+        connection = pymysql.connect(
+            host=db_host,
+            user=db_user,
+            password=db_password,
+            database=db_name,
+            port=3306,
+        )
+        with connection.cursor() as cursor:
+            sql = "UPDATE wine SET winelabel_crop = %s WHERE id = %s"
+            cursor.execute(sql, (s3_key, wine_id))
+        connection.commit()
+        print(f"[DB] updated wine.id={wine_id} -> {s3_key}")
+    except pymysql.MySQLError as e:
+        print(f"[DB] update failed: {e}")
+    finally:
+        if connection:
+            connection.close()
+
 # -----------------------------
 # main
 # -----------------------------
@@ -480,22 +586,25 @@ if __name__ == "__main__":
     print("[DEBUG] Google Generative AI:", "ON" if _gemini_client else "OFF")
     print("[DEBUG] SAM:", "ON" if (USE_SAM and _sam_available and os.path.exists(SAM_CHECKPOINT)) else "OFF")
 
-    for i, (img_cv, url) in enumerate(fetch_data(limit=1, total_results=10), start=1):
+    if not check_s3_permissions():
+        raise RuntimeError("S3 권한 확인 실패")
+
+    for i, (wine_id, img_cv, url, original_url) in enumerate(fetch_data(limit=1, total_results=10), start=1):
         final_bbox, dbg = detect_label_edges_gemini_sam(img_cv, url)
 
         # 디버그 항상 저장
-        save_debug(
-            idx=i,
-            url=url,
-            bgr=img_cv,
-            assist=dbg["assist"],
-            edges=dbg["edges"],
-            edges_work=dbg["edges_work"],
-            candidate_box=dbg["candidate_box"],
-            gemini_bbox=dbg["gemini_bbox"],
-            sam_bbox=dbg["sam_bbox"],
-            sam_mask=dbg["sam_mask"],
-        )
+        # save_debug(
+        #     idx=i,
+        #     url=url,
+        #     bgr=img_cv,
+        #     assist=dbg["assist"],
+        #     edges=dbg["edges"],
+        #     edges_work=dbg["edges_work"],
+        #     candidate_box=dbg["candidate_box"],
+        #     gemini_bbox=dbg["gemini_bbox"],
+        #     sam_bbox=dbg["sam_bbox"],
+        #     sam_mask=dbg["sam_mask"],
+        # )
 
         if final_bbox is None:
             print(f"[{i:03d}] label not found:", url)
@@ -503,10 +612,21 @@ if __name__ == "__main__":
 
         crop = crop_by_xyxy(img_cv, final_bbox)
 
-        base = safe_filename(url)
-        out_img = os.path.join(OUT_DIR, f"{i:03d}_{base}_label.png")
-        cv2.imwrite(out_img, crop)
+        if crop.size == 0:
+            print(f"[{i:03d}] empty crop: {url}")
+            continue
+
+        s3_key = make_label_s3_key(url)
+        crop_bytes = encode_bgr_to_png_bytes(crop)
+        s3_url = upload_bytes_to_s3(crop_bytes, s3_key, content_type="image/png")
 
         method = "sam" if dbg["sam_bbox"] is not None else ("gemini" if dbg["gemini_bbox"] is not None else "edges")
-        print(f"[{i:03d}] saved: {out_img} ({method})")
+
+        if s3_url:
+            json_value = json.dumps({original_url: s3_key}, ensure_ascii=False)
+            update_winelabel_crop(wine_id, json_value)
+            print(f"[{i:03d}] uploaded: {s3_url} ({method})")
+        else:
+            print(f"[{i:03d}] S3 upload failed: {url}")
+
         time.sleep(1.0)

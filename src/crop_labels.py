@@ -1,10 +1,14 @@
 import os
 import re
 import json
+import pymysql
 import base64
 import numpy as np
 import cv2
 import boto3
+from urllib.parse import urlparse
+from botocore.exceptions import BotoCoreError, ClientError
+
 # -----------------------------
 # 환경 설정
 # -----------------------------
@@ -17,10 +21,23 @@ except Exception:
 # Gemini AI 설정
 GEMINI_API_KEY = os.getenv("GEMINI_API_KEY")
 
+db_host = os.getenv("DB_HOST")
+db_user = os.getenv("DB_USER")
+db_password = os.getenv("DB_PASSWORD")
+db_name = os.getenv("DB_NAME")
+
+# aws 설정
+AWS_ACCESS_KEY_ID = os.getenv("AWS_ACCESS_KEY_ID")
+AWS_SECRET_ACCESS_KEY = os.getenv("AWS_SECRET_ACCESS_KEY")
+AWS_REGION = os.getenv("AWS_REGION")
+S3_BUCKET_NAME = os.getenv("S3_BUCKET_NAME")
+S3_LABEL_PREFIX = os.getenv("S3_LABEL_PREFIX")
+
 # SAM 사용 여부 및 체크포인트
 USE_SAM = os.getenv("USE_SAM", "1") == "1"
 SAM_MODEL_TYPE = os.getenv("SAM_MODEL_TYPE", "vit_b")  # vit_b / vit_l / vit_h
 SAM_CHECKPOINT = os.getenv("SAM_CHECKPOINT", "models/sam_vit_b_01ec64.pth")  # 상대/절대 경로 모두 가능
+
 
 # -----------------------------
 # Gemini client
@@ -161,20 +178,6 @@ def score_label_mask(mask: np.ndarray, w: int, h: int) -> float:
 
     return (2.0 * fill + 0.6 * final_position_score) * ar_pen
     
-# -----------------------------
-# Edge assist image 생성
-# -----------------------------
-def create_edge_assist_image(bgr: np.ndarray):
-    gray = cv2.cvtColor(bgr, cv2.COLOR_BGR2GRAY)
-
-    # CLAHE, glare 제거, morphology 제거
-    edges = cv2.Canny(gray, 80, 160)
-
-    assist = cv2.cvtColor(gray, cv2.COLOR_GRAY2BGR)
-    assist[edges > 0] = (255, 255, 255)
-
-    return assist, edges, gray
-
 def find_label_roi_from_edges(edges: np.ndarray, image_shape, debug: bool = False):
     import cv2
     h, w = image_shape[:2]
@@ -296,7 +299,7 @@ def detect_bbox_with_gemini(color_bgr: np.ndarray, assist_bgr: np.ndarray, origi
             ]
         )
         resp_text = response.text
-        print("Gemini API 응답:", resp_text)
+        # print("Gemini API 응답:", resp_text)
 
         # JSON 추출
         data = safe_json_extract(resp_text)
@@ -427,12 +430,124 @@ def create_edge_assist_image(bgr: np.ndarray):
     enhanced = clahe.apply(gray)
     
     edges = cv2.Canny(enhanced, 40, 140)
-    kernel = np.ones((3, 3), np.uint8)
     
     assist = cv2.cvtColor(gray, cv2.COLOR_GRAY2BGR)
     assist[edges > 0] = (255, 255, 255)
     
     return assist, edges, enhanced
+
+def get_s3_client():
+    return boto3.client(
+        "s3",
+        aws_access_key_id=AWS_ACCESS_KEY_ID,
+        aws_secret_access_key=AWS_SECRET_ACCESS_KEY,
+        region_name=AWS_REGION,
+    )
+
+def check_s3_permissions():
+    try:
+        s3 = get_s3_client()
+
+        # 버킷 접근 확인
+        s3.head_bucket(Bucket=S3_BUCKET_NAME)
+        print(f"[S3] bucket 접근 OK: {S3_BUCKET_NAME}")
+
+        # 업로드 권한 확인
+        test_key = f"{(S3_LABEL_PREFIX or 'label').strip('/')}/__permission_test__.txt"
+
+        s3.put_object(
+            Bucket=S3_BUCKET_NAME,
+            Key=test_key,
+            Body=b"permission test",
+            ContentType="text/plain"
+        )
+
+        print(f"[S3] PutObject OK: {test_key}")
+
+        return True
+
+    except Exception as e:
+        print(f"[S3] 권한 확인 실패: {e}")
+        return False
+
+def test_s3_connection():
+    try:
+        s3 = get_s3_client()
+        s3.head_bucket(Bucket=S3_BUCKET_NAME)
+        print(f"[S3] 연결 성공: bucket={S3_BUCKET_NAME}, region={AWS_REGION}")
+        return True
+    except Exception as e:
+        print(f"[S3] 연결 실패: {e}")
+        return False
+    
+def test_s3_upload():
+    try:
+        s3 = get_s3_client()
+        test_key = f"{(S3_LABEL_PREFIX or 'label').strip('/')}/__s3_connection_test__.txt"
+        s3.put_object(
+            Bucket=S3_BUCKET_NAME,
+            Key=test_key,
+            Body=b"test",
+            ContentType="text/plain"
+        )
+        print(f"[S3] 업로드 테스트 성공: {test_key}")
+        return True
+    except Exception as e:
+        print(f"[S3] 업로드 테스트 실패: {e}")
+        return False
+    
+def extract_filename_from_url(url: str) -> str:
+    path = urlparse(url).path
+    filename = os.path.basename(path)
+    if not filename:
+        raise ValueError(f"파일명을 추출할 수 없습니다: {url}")
+    return filename
+
+def make_label_s3_key(original_url: str) -> str:
+    filename = extract_filename_from_url(original_url)
+    prefix = (S3_LABEL_PREFIX or "label").strip("/")
+    return f"{prefix}/{filename}"
+
+def upload_bytes_to_s3(image_bytes: bytes, s3_key: str, content_type: str = "image/png") -> str | None:
+    try:
+        s3 = get_s3_client()
+        s3.put_object(
+            Bucket=S3_BUCKET_NAME,
+            Key=s3_key,
+            Body=image_bytes,
+            ContentType=content_type,
+        )
+        return f"https://{S3_BUCKET_NAME}.s3.{AWS_REGION}.amazonaws.com/{s3_key}"
+    except (BotoCoreError, ClientError, Exception) as e:
+        print(f"[S3] upload failed: {e}")
+        return None
+    
+def update_winelabel_crop(wine_id: int, image_url: str):
+    connection = None
+    try:
+        connection = pymysql.connect(
+            host=db_host,
+            user=db_user,
+            password=db_password,
+            database=db_name,
+            port=3306,
+        )
+        with connection.cursor() as cursor:
+            sql = "UPDATE wine SET winelabel_crop = %s WHERE id = %s"
+            cursor.execute(sql, (image_url, wine_id))
+        connection.commit()
+        print(f"[DB] updated wine.id={wine_id} -> {image_url}")
+    except pymysql.MySQLError as e:
+        print(f"[DB] update failed: {e}")
+    finally:
+        if connection:
+            connection.close()
+
+def encode_bgr_to_png_bytes(bgr: np.ndarray) -> bytes:
+    ok, buf = cv2.imencode(".png", bgr)
+    if not ok:
+        raise ValueError("cv2.imencode failed")
+    return buf.tobytes()
 
 # -----------------------------
 # 디버그 저장
@@ -483,11 +598,13 @@ def save_debug_bundle(index: int,
         with open(os.path.join(DEBUG_DIR, f"{prefix}_gemini_response.txt"), "w", encoding="utf-8") as f:
             f.write(gemini_text)
 
+
 # -----------------------------
 # 메인 엔트리
 # -----------------------------
-def crop_labels(image: np.ndarray, data_url: str, index: int, debug: bool = True):
-    import cv2  # OpenCV를 함수 내부에서만 사용
+def crop_labels(wine_id: int, image: np.ndarray, data_url: str, original_url: str, index: int, debug: bool = True):
+    import cv2
+
     if image is None or not hasattr(image, "shape"):
         raise ValueError("image must be a valid OpenCV image (numpy array).")
 
@@ -495,107 +612,164 @@ def crop_labels(image: np.ndarray, data_url: str, index: int, debug: bool = True
     os.makedirs(DEBUG_DIR, exist_ok=True)
 
     out_idx = index + 1
+    uploaded_s3_url = None
+    uploaded_s3_key = None
+    out_path = None
 
-    # 이미지 전처리: 배경 제거 및 대비 조정
+    # 이미지 전처리
     preprocessed_image = preprocess_image(image)
 
-    # CLAHE 이미지 저장 (디버깅)
+    # 디버그용 grayscale
     clahe_image = cv2.cvtColor(preprocessed_image, cv2.COLOR_BGR2GRAY)
     debug_clahe_image = cv2.cvtColor(clahe_image, cv2.COLOR_GRAY2BGR)
 
     # 엣지 보조 이미지 생성
     assist_image, edges, enhanced_gray = create_edge_assist_image(preprocessed_image)
 
-    # Gemini AI로부터 bbox를 찾기
+    # Gemini bbox 탐지
     gemini_bbox, info = detect_bbox_with_gemini(preprocessed_image, assist_image, data_url)
     gemini_text = info.get("response") if isinstance(info, dict) else None
 
     if gemini_bbox is None:
         print(f"[{out_idx:03d}] ❌ Gemini bbox not found")
-        return
-    
-    padding = 0
+        return {
+            "s3_url": None,
+            "s3_key": None,
+            "local_path": None,
+        }
 
-    # 패딩을 추가하여 bounding box 확장
+    # Gemini bbox 보정
+    padding = 0
     x1, y1, x2, y2 = gemini_bbox
-    x1, y1, x2, y2 = clamp_bbox(x1, y1, x2, y2 + padding, preprocessed_image.shape[1], preprocessed_image.shape[0])
+    x1, y1, x2, y2 = clamp_bbox(
+        x1, y1, x2, y2 + padding,
+        preprocessed_image.shape[1],
+        preprocessed_image.shape[0]
+    )
 
     # SAM refine
     refined_bbox = None
     sam_mask = None
-    section_scores = []
 
     if USE_SAM:
         rb, sam_info = refine_bbox_with_sam(preprocessed_image, (x1, y1, x2, y2))
         if rb is not None:
             refined_bbox = rb
+
         if isinstance(sam_info, dict) and sam_info.get("mask") is not None:
             sam_mask = sam_info["mask"]
 
             scores = []
             section_height = preprocessed_image.shape[0] / 40
 
-            for i in range(40):
-                if i >= 37:
+            for sec_idx in range(40):
+                if sec_idx >= 37:
                     score = -1e9
                 else:
                     section_mask = np.zeros_like(sam_mask)
-                    y1 = int(i * section_height)
-                    y2 = int((i + 1) * section_height)
-                    section_mask[y1:y2, :] = sam_mask[y1:y2, :]
-                    score = score_label_mask(section_mask, preprocessed_image.shape[1], preprocessed_image.shape[0])
-                
+                    sy1 = int(sec_idx * section_height)
+                    sy2 = int((sec_idx + 1) * section_height)
+                    section_mask[sy1:sy2, :] = sam_mask[sy1:sy2, :]
+                    score = score_label_mask(
+                        section_mask,
+                        preprocessed_image.shape[1],
+                        preprocessed_image.shape[0]
+                    )
                 scores.append(score)
 
-            # 평균 점수 계산
-            average_score = sum(scores) / len(scores)
-            print(f"[{out_idx:03d}] 평균 점수: {average_score:.2f}, 섹션 점수: {scores}")
+            # average_score = sum(scores) / len(scores)
+            # print(f"[{out_idx:03d}] 평균 점수: {average_score:.2f}, 섹션 점수: {scores}")
 
-            # 디버깅 이미지에 각 섹션 그리기
-            if debug:
-                debug_image = image.copy()  # 디버깅 이미지를 위한 복사본 생성
-                for i, score in enumerate(scores):
-                    section_y1 = int(i * section_height)
-                    section_y2 = int((i + 1) * section_height)
-                    cv2.rectangle(debug_image, (0, section_y1), (preprocessed_image.shape[1], section_y2), (0, 255, 0), 1)  # 섹션 경계 그리기
-                    cv2.putText(debug_image, f'Score: {score:.2f}', (10, section_y1 + 20), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 255, 0), 1)
+            # if debug:
+            #     debug_image = image.copy()
+            #     for sec_idx, score in enumerate(scores):
+            #         sy1 = int(sec_idx * section_height)
+            #         sy2 = int((sec_idx + 1) * section_height)
+            #         cv2.rectangle(
+            #             debug_image,
+            #             (0, sy1),
+            #             (preprocessed_image.shape[1], sy2),
+            #             (0, 255, 0),
+            #             1
+            #         )
+            #         cv2.putText(
+            #             debug_image,
+            #             f"Score: {score:.2f}",
+            #             (10, sy1 + 20),
+            #             cv2.FONT_HERSHEY_SIMPLEX,
+            #             0.5,
+            #             (0, 255, 0),
+            #             1
+            #         )
+            #
+            #     cv2.imwrite(os.path.join(DEBUG_DIR, f"{out_idx:03d}_section_scores.png"), debug_image)
 
-                # 디버깅 이미지 저장
-                cv2.imwrite(os.path.join(DEBUG_DIR, f"{out_idx:03d}_section_scores.png"), debug_image)
-
-    # 초기 크롭 박스 설정 
+    # 최종 bbox 결정
     final_bbox = refined_bbox if refined_bbox is not None else (x1, y1, x2, y2)
-    pad = int(min(preprocessed_image.shape[:2]) * 0.0)  # 여유
     x1, y1, x2, y2 = final_bbox
-    x1, y1, x2, y2 = clamp_bbox(x1, y1, x2, y2, preprocessed_image.shape[1], preprocessed_image.shape[0], pad=pad)
+    x1, y1, x2, y2 = clamp_bbox(
+        x1, y1, x2, y2,
+        preprocessed_image.shape[1],
+        preprocessed_image.shape[0],
+        pad=0
+    )
 
-    # 크롭 및 저장
+    # 최종 crop
     crop = image[y1:y2, x1:x2].copy()
-    out_path = os.path.join(OUT_DIR, OUT_LABEL_TEMPLATE.format(out_idx))
-    
-    if cv2.imwrite(out_path, crop):
-        print(f"[{out_idx:03d}] Saved label crop: {out_path} (initial crop with padding)")
-    else:
-        print(f"[{out_idx:03d}] Failed to save label crop.")
+    if crop.size == 0:
+        print(f"[{out_idx:03d}] Empty crop image")
+        return {
+            "s3_url": None,
+            "s3_key": None,
+            "local_path": None,
+        }
+    out_path = None
 
-    # 세밀한 조정을 위해 반복
-    for i in range(2):  # 2회 반복하여 크롭 범위를 줄임
-        pad = int(min(preprocessed_image.shape[:2]) * 0.001)  # 여유를 0%로 설정
-        x1, y1, x2, y2 = final_bbox
-        x1, y1, x2, y2 = clamp_bbox(x1, y1, x2, y2, preprocessed_image.shape[1], preprocessed_image.shape[0], pad=pad)
+    # 로컬 저장 비활성화
+    # out_path = os.path.join(OUT_DIR, OUT_LABEL_TEMPLATE.format(out_idx))
+    # if cv2.imwrite(out_path, crop):
+    #     print(f"[{out_idx:03d}] Saved label crop: {out_path}")
+    # else:
+    #     print(f"[{out_idx:03d}] Failed to save label crop.")
+    #     out_path = None
 
-        crop = image[y1:y2, x1:x2].copy()
-        out_path = os.path.join(OUT_DIR, OUT_LABEL_TEMPLATE.format(out_idx))
+    # S3 업로드
+    try:
+        uploaded_s3_key = make_label_s3_key(data_url)
+        crop_bytes = encode_bgr_to_png_bytes(crop)
+        uploaded_s3_url = upload_bytes_to_s3(
+            image_bytes=crop_bytes,
+            s3_key=uploaded_s3_key,
+            content_type="image/png"
+        )
 
-        if cv2.imwrite(out_path, crop):
-            print(f"[{out_idx:03d}] Saved refined label crop: {out_path} (iteration {i+1})")
-            break  # 성공적으로 저장하면 반복 중지
-    else:
-        print(f"[{out_idx:03d}] Failed to save refined label crop.")
+        if uploaded_s3_url:
+            print(f"[{out_idx:03d}] Uploaded label to S3: {uploaded_s3_url}")
+            json_value = json.dumps({original_url: uploaded_s3_key}, ensure_ascii=False)
+            update_winelabel_crop(wine_id, json_value)
+        else:
+            print(f"[{out_idx:03d}] S3 upload failed")
+    except Exception as e:
+        print(f"[{out_idx:03d}] S3 upload error: {e}")
 
-    if debug:
-        # 디버그 이미지 저장
-        save_debug_bundle(index=out_idx, bgr=image, assist=assist_image, enhanced_gray=enhanced_gray,
-                          edges=edges, clahe_image=debug_clahe_image, url=data_url, 
-                          gemini_bbox=gemini_bbox, refined_bbox=refined_bbox, 
-                          gemini_text=gemini_text, sam_mask=sam_mask)
+    # 디버그 저장 비활성화
+    # if debug:
+    #     save_debug_bundle(
+    #         index=out_idx,
+    #         bgr=image,
+    #         assist=assist_image,
+    #         enhanced_gray=enhanced_gray,
+    #         edges=edges,
+    #         clahe_image=debug_clahe_image,
+    #         url=data_url,
+    #         gemini_bbox=gemini_bbox,
+    #         refined_bbox=refined_bbox,
+    #         gemini_text=gemini_text,
+    #         sam_mask=sam_mask
+    #     )
+
+    return {
+        "s3_url": uploaded_s3_url,
+        "s3_key": uploaded_s3_key,
+        "local_path": out_path,
+    }
