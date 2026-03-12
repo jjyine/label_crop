@@ -105,7 +105,7 @@ def select_best_image(image_data):
 
     return None, None
 
-def fetch_data(limit=1, total_results=1, start_row=0):
+def fetch_data(limit=1, total_results=None, start_id=380):
     connection = None
     try:
         connection = pymysql.connect(
@@ -116,13 +116,23 @@ def fetch_data(limit=1, total_results=1, start_row=0):
             port=3306,
         )
 
-        offset = start_row
+        last_id = start_id
         fetched_results = 0
 
-        while fetched_results < total_results:
+        while True:
+            if total_results is not None and fetched_results >= total_results:
+                break
+
             with connection.cursor() as cursor:
-                sql = f"SELECT id, s3_images FROM wine WHERE s3_images IS NOT NULL LIMIT {limit} OFFSET {offset};"
-                cursor.execute(sql)
+                sql = """
+                    SELECT id, s3_images
+                    FROM wine
+                    WHERE s3_images IS NOT NULL
+                      AND id > %s
+                    ORDER BY id ASC
+                    LIMIT %s
+                """
+                cursor.execute(sql, (last_id, limit))
                 results = cursor.fetchall()
 
                 if not results:
@@ -131,29 +141,72 @@ def fetch_data(limit=1, total_results=1, start_row=0):
 
                 for row in results:
                     wine_id = row[0]
-                    image_data = json.loads(row[1])
-                    selected_url, selected_key = select_best_image(image_data)
+                    raw_s3_images = row[1]
 
-                    if selected_url and selected_key:
-                        final_image_url = f"https://vin-social.s3.amazonaws.com/{selected_key}"
-                        print("Fetching image from URL:", final_image_url)
+                    # 다음 페이지 기준 id 갱신
+                    last_id = wine_id
 
-                        response = requests.get(final_image_url)
+                    # 1) s3_images JSON 파싱
+                    try:
+                        if not raw_s3_images or not str(raw_s3_images).strip():
+                            print(f"[SKIP] wine.id={wine_id} - s3_images is empty")
+                            continue
+
+                        image_data = json.loads(raw_s3_images)
+
+                        if not isinstance(image_data, dict) or not image_data:
+                            print(f"[SKIP] wine.id={wine_id} - s3_images json is empty or not dict")
+                            continue
+
+                    except json.JSONDecodeError as e:
+                        print(f"[SKIP] wine.id={wine_id} - invalid s3_images json: {e}")
+                        continue
+                    except Exception as e:
+                        print(f"[SKIP] wine.id={wine_id} - failed to parse s3_images: {e}")
+                        continue
+
+                    # 2) 사용할 이미지 선택
+                    try:
+                        selected_url, selected_key = select_best_image(image_data)
+                        if not selected_url or not selected_key:
+                            print(f"[SKIP] wine.id={wine_id} - no selectable image found")
+                            continue
+                    except Exception as e:
+                        print(f"[SKIP] wine.id={wine_id} - image selection failed: {e}")
+                        continue
+
+                    final_image_url = f"https://vin-social.s3.amazonaws.com/{selected_key}"
+                    print("Fetching image from URL:", final_image_url)
+
+                    # 3) 이미지 다운로드
+                    try:
+                        response = requests.get(final_image_url, timeout=15)
                         response.raise_for_status()
+                    except requests.RequestException as e:
+                        print(f"[SKIP] wine.id={wine_id} - image download failed: {e}")
+                        continue
+                    except Exception as e:
+                        print(f"[SKIP] wine.id={wine_id} - unexpected download error: {e}")
+                        continue
 
+                    # 4) 이미지 열기 / OpenCV 변환
+                    try:
                         img = Image.open(BytesIO(response.content)).convert("RGB")
                         img_cv = cv2.cvtColor(np.array(img), cv2.COLOR_RGB2BGR)
+                    except Exception as e:
+                        print(f"[SKIP] wine.id={wine_id} - image decode/convert failed: {e}")
+                        continue
 
-                        fetched_results += 1
-                        yield wine_id, img_cv, final_image_url, selected_url
+                    fetched_results += 1
+                    yield wine_id, img_cv, final_image_url, selected_url
 
-                        if fetched_results >= total_results:
-                            break
-
-                offset += limit
+                    if total_results is not None and fetched_results >= total_results:
+                        break
 
     except pymysql.MySQLError as e:
         print("DB connect failed:", e)
+    except Exception as e:
+        print("Unexpected fetch_data error:", e)
     finally:
         if connection:
             connection.close()

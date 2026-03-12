@@ -744,7 +744,7 @@ def crop_labels(wine_id: int, image: np.ndarray, data_url: str, original_url: st
         )
 
         if uploaded_s3_url:
-            print(f"[{out_idx:03d}] Uploaded label to S3: {uploaded_s3_url}")
+            print(f"[{out_idx:03d}] | wine_id={wine_id} Uploaded label to S3: {uploaded_s3_url}")
             json_value = json.dumps({original_url: uploaded_s3_key}, ensure_ascii=False)
             update_winelabel_crop(wine_id, json_value)
         else:

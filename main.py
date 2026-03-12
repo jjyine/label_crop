@@ -6,11 +6,11 @@ import torchvision
 from torchvision.models.detection import MaskRCNN_ResNet50_FPN_Weights
 
 def main():
-    limit = 1
-    total_results = 1
+    limit = 100
+    total_results = None
 
     for i, (wine_id, image, data_url, original_url) in enumerate(fetch_data(limit=limit, total_results=total_results)):
-        logging.info(f"API 호출 중: 이미지 {i + 1}/{total_results} 가져오는 중...")
+        # logging.info(f"API 호출 중: 이미지 {i + 1}/{total_results} 가져오는 중...")
 
         while True:
             try:
