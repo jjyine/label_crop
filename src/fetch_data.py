@@ -105,7 +105,7 @@ def select_best_image(image_data):
 
     return None, None
 
-def fetch_data(limit=1, total_results=None, start_id=380):
+def fetch_data(limit=1, total_results=None, start_id=400):
     connection = None
     try:
         connection = pymysql.connect(
@@ -125,10 +125,17 @@ def fetch_data(limit=1, total_results=None, start_id=380):
 
             with connection.cursor() as cursor:
                 sql = """
-                    SELECT id, s3_images
+                    SELECT id, s3_images, vv_ratings_count
                     FROM wine
                     WHERE s3_images IS NOT NULL
-                      AND id > %s
+                    AND TRIM(s3_images) != ''
+                    AND vv_ratings_count IS NOT NULL
+                    AND vv_ratings_count < 50
+                    AND (
+                            winelabel_crop IS NULL
+                            OR TRIM(winelabel_crop) = ''
+                        )
+                    AND id > %s
                     ORDER BY id ASC
                     LIMIT %s
                 """
@@ -142,9 +149,12 @@ def fetch_data(limit=1, total_results=None, start_id=380):
                 for row in results:
                     wine_id = row[0]
                     raw_s3_images = row[1]
+                    review_cnt = row[2]
 
                     # 다음 페이지 기준 id 갱신
                     last_id = wine_id
+
+                    print(f"[INFO] wine.id={wine_id}, review_cnt={review_cnt}")
 
                     # 1) s3_images JSON 파싱
                     try:
