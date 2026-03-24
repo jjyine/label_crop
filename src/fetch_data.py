@@ -42,6 +42,9 @@ DEBUG_DIR = os.path.join(os.getcwd(), "out_debug")
 os.makedirs(OUT_DIR, exist_ok=True)
 os.makedirs(DEBUG_DIR, exist_ok=True)
 
+UPLOAD_TO_S3 = os.getenv("UPLOAD_TO_S3", "1") == "1"
+SAVE_TO_DB = os.getenv("SAVE_TO_DB", "1") == "1"
+
 # -----------------------------
 # Google Generative AI client
 # -----------------------------
@@ -105,7 +108,7 @@ def select_best_image(image_data):
 
     return None, None
 
-def fetch_data(limit=1, total_results=None, start_id=400):
+def fetch_data(limit=1, total_results=None, start_id=400, min_count=None, max_count=None):
     connection = None
     try:
         connection = pymysql.connect(
@@ -124,26 +127,45 @@ def fetch_data(limit=1, total_results=None, start_id=400):
                 break
 
             with connection.cursor() as cursor:
-                sql = """
+                where_clauses = [
+                    "s3_images IS NOT NULL",
+                    "TRIM(s3_images) != ''",
+                    "vv_ratings_count IS NOT NULL",
+                    "vv_ratings_count < 50",   # 고정 조건 유지
+                    """
+                    (
+                        winelabel_crop IS NULL
+                        OR TRIM(winelabel_crop) = ''
+                    )
+                    """,
+                    "id > %s"
+                ]
+                params = [last_id]
+
+                if min_count is not None:
+                    where_clauses.append("vv_ratings_count >= %s")
+                    params.append(min_count)
+
+                if max_count is not None:
+                    where_clauses.append("vv_ratings_count <= %s")
+                    params.append(max_count)
+
+                where_sql = "\nAND ".join(where_clauses)
+
+                sql = f"""
                     SELECT id, s3_images, vv_ratings_count
                     FROM wine
-                    WHERE s3_images IS NOT NULL
-                    AND TRIM(s3_images) != ''
-                    AND vv_ratings_count IS NOT NULL
-                    AND vv_ratings_count < 50
-                    AND (
-                            winelabel_crop IS NULL
-                            OR TRIM(winelabel_crop) = ''
-                        )
-                    AND id > %s
+                    WHERE {where_sql}
                     ORDER BY id ASC
                     LIMIT %s
                 """
-                cursor.execute(sql, (last_id, limit))
+                params.append(limit)
+
+                cursor.execute(sql, tuple(params))
                 results = cursor.fetchall()
 
                 if not results:
-                    print("No more images to fetch.")
+                    print(f"No more images to fetch. range=({min_count}, {max_count})")
                     break
 
                 for row in results:
@@ -154,35 +176,35 @@ def fetch_data(limit=1, total_results=None, start_id=400):
                     # 다음 페이지 기준 id 갱신
                     last_id = wine_id
 
-                    print(f"[INFO] wine.id={wine_id}, review_cnt={review_cnt}")
+                    # print(f"[INFO] wine.id={wine_id}, review_cnt={review_cnt}, range=({min_count}, {max_count})")
 
                     # 1) s3_images JSON 파싱
                     try:
                         if not raw_s3_images or not str(raw_s3_images).strip():
-                            print(f"[SKIP] wine.id={wine_id} - s3_images is empty")
+                            # print(f"[SKIP] wine.id={wine_id} - s3_images is empty")
                             continue
 
                         image_data = json.loads(raw_s3_images)
 
                         if not isinstance(image_data, dict) or not image_data:
-                            print(f"[SKIP] wine.id={wine_id} - s3_images json is empty or not dict")
+                            # print(f"[SKIP] wine.id={wine_id} - s3_images json is empty or not dict")
                             continue
 
                     except json.JSONDecodeError as e:
-                        print(f"[SKIP] wine.id={wine_id} - invalid s3_images json: {e}")
+                        # print(f"[SKIP] wine.id={wine_id} - invalid s3_images json: {e}")
                         continue
                     except Exception as e:
-                        print(f"[SKIP] wine.id={wine_id} - failed to parse s3_images: {e}")
+                        # print(f"[SKIP] wine.id={wine_id} - failed to parse s3_images: {e}")
                         continue
 
                     # 2) 사용할 이미지 선택
                     try:
                         selected_url, selected_key = select_best_image(image_data)
                         if not selected_url or not selected_key:
-                            print(f"[SKIP] wine.id={wine_id} - no selectable image found")
+                            # print(f"[SKIP] wine.id={wine_id} - no selectable image found")
                             continue
                     except Exception as e:
-                        print(f"[SKIP] wine.id={wine_id} - image selection failed: {e}")
+                        # print(f"[SKIP] wine.id={wine_id} - image selection failed: {e}")
                         continue
 
                     final_image_url = f"https://vin-social.s3.amazonaws.com/{selected_key}"
@@ -193,10 +215,10 @@ def fetch_data(limit=1, total_results=None, start_id=400):
                         response = requests.get(final_image_url, timeout=15)
                         response.raise_for_status()
                     except requests.RequestException as e:
-                        print(f"[SKIP] wine.id={wine_id} - image download failed: {e}")
+                        # print(f"[SKIP] wine.id={wine_id} - image download failed: {e}")
                         continue
                     except Exception as e:
-                        print(f"[SKIP] wine.id={wine_id} - unexpected download error: {e}")
+                        # print(f"[SKIP] wine.id={wine_id} - unexpected download error: {e}")
                         continue
 
                     # 4) 이미지 열기 / OpenCV 변환
@@ -204,7 +226,7 @@ def fetch_data(limit=1, total_results=None, start_id=400):
                         img = Image.open(BytesIO(response.content)).convert("RGB")
                         img_cv = cv2.cvtColor(np.array(img), cv2.COLOR_RGB2BGR)
                     except Exception as e:
-                        print(f"[SKIP] wine.id={wine_id} - image decode/convert failed: {e}")
+                        # print(f"[SKIP] wine.id={wine_id} - image decode/convert failed: {e}")
                         continue
 
                     fetched_results += 1
@@ -681,14 +703,31 @@ if __name__ == "__main__":
 
         s3_key = make_label_s3_key(url)
         crop_bytes = encode_bgr_to_png_bytes(crop)
-        s3_url = upload_bytes_to_s3(crop_bytes, s3_key, content_type="image/png")
+
+        # 기존 코드
+        # s3_url = upload_bytes_to_s3(crop_bytes, s3_key, content_type="image/png")
+
+        # 수정 코드: 테스트 시 S3 업로드 막기
+        if UPLOAD_TO_S3:
+            s3_url = upload_bytes_to_s3(crop_bytes, s3_key, content_type="image/png")
+        else:
+            s3_url = f"mock://{s3_key}"
+            print(f"[{i:03d}] S3 upload skipped (UPLOAD_TO_S3=0): {s3_url}")
 
         method = "sam" if dbg["sam_bbox"] is not None else ("gemini" if dbg["gemini_bbox"] is not None else "edges")
 
         if s3_url:
             json_value = json.dumps({original_url: s3_key}, ensure_ascii=False)
-            update_winelabel_crop(wine_id, json_value)
-            print(f"[{i:03d}] uploaded: {s3_url} ({method})")
+
+            # 기존 코드
+            # update_winelabel_crop(wine_id, json_value)
+
+            # 수정 코드: 테스트 시 DB 업데이트 막기
+            if SAVE_TO_DB:
+                update_winelabel_crop(wine_id, json_value)
+                print(f"[{i:03d}] uploaded: {s3_url} ({method}) [DB updated]")
+            else:
+                print(f"[{i:03d}] uploaded: {s3_url} ({method}) [DB update skipped]")
         else:
             print(f"[{i:03d}] S3 upload failed: {url}")
 
