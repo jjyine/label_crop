@@ -132,7 +132,6 @@ def fetch_data(limit=1, total_results=None, start_id=400, min_count=None, max_co
                     "s3_images IS NOT NULL",
                     "TRIM(s3_images) != ''",
                     "vv_ratings_count IS NOT NULL",
-                    "vv_ratings_count < 50",   # 고정 조건 유지
                     """
                     (
                         winelabel_crop IS NULL
@@ -141,6 +140,7 @@ def fetch_data(limit=1, total_results=None, start_id=400, min_count=None, max_co
                     """,
                     "id > %s"
                 ]
+
                 params = [last_id]
 
                 if min_count is not None:
@@ -160,6 +160,7 @@ def fetch_data(limit=1, total_results=None, start_id=400, min_count=None, max_co
                     ORDER BY id ASC
                     LIMIT %s
                 """
+
                 params.append(limit)
 
                 cursor.execute(sql, tuple(params))
