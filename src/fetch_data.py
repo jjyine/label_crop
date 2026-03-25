@@ -12,6 +12,7 @@ from dotenv import load_dotenv
 import boto3
 from urllib.parse import urlparse
 from botocore.exceptions import BotoCoreError, ClientError
+from src.crop_labels import _thread_local
 
 # -----------------------------
 # ENV / 설정
@@ -641,26 +642,65 @@ def detect_label_edges_gemini_sam(bgr: np.ndarray, url: str):
         "sam_mask": sam_mask,
     }
 
+import time
+import pymysql
+
+
 def update_winelabel_crop(wine_id: int, s3_key: str):
-    connection = None
-    try:
-        connection = pymysql.connect(
-            host=db_host,
-            user=db_user,
-            password=db_password,
-            database=db_name,
-            port=3306,
-        )
-        with connection.cursor() as cursor:
-            sql = "UPDATE wine SET winelabel_crop = %s WHERE id = %s"
-            cursor.execute(sql, (s3_key, wine_id))
-        connection.commit()
-        print(f"[DB] updated wine.id={wine_id} -> {s3_key}")
-    except pymysql.MySQLError as e:
-        print(f"[DB] update failed: {e}")
-    finally:
-        if connection:
-            connection.close()
+    logger = getattr(_thread_local, "logger", None)
+
+    max_retries = 5
+    wait_time = 2  
+
+    for attempt in range(max_retries):
+        connection = None
+        try:
+            connection = pymysql.connect(
+                host=db_host,
+                user=db_user,
+                password=db_password,
+                database=db_name,
+                port=3306,
+                connect_timeout=5,
+                read_timeout=10,
+                write_timeout=10,
+            )
+
+            with connection.cursor() as cursor:
+                sql = "UPDATE wine SET winelabel_crop = %s WHERE id = %s"
+                cursor.execute(sql, (s3_key, wine_id))
+
+            connection.commit()
+
+            if logger:
+                logger.info(f"[DB] 저장 성공 wine_id={wine_id}")
+            else:
+                print(f"[DB] 저장 성공 wine_id={wine_id}")
+
+            return True
+
+        except pymysql.MySQLError as e:
+            if logger:
+                logger.warning(f"[DB] attempt {attempt + 1} 실패 wine_id={wine_id}, error={e}")
+            else:
+                print(f"[DB] attempt {attempt + 1} failed: {e}")
+
+            if attempt == max_retries - 1:
+                if logger:
+                    logger.error(f"[DB] 최종 실패 wine_id={wine_id}")
+                else:
+                    print(f"[DB] 최종 실패 wine.id={wine_id}")
+                return False
+
+            time.sleep(wait_time)
+            wait_time *= 2
+
+        finally:
+            if connection:
+                try:
+                    connection.close()
+                except Exception:
+                    pass
 
 # -----------------------------
 # main
