@@ -1,6 +1,8 @@
 # 가상환경
 .venv/
 venv/
+.env
+.env.*
 
 # vscode
 .vscode/
@@ -11,6 +13,7 @@ __pycache__/
 
 # model files
 *.pt
+*.pth
 *.weights
 *.cfg
 
@@ -28,3 +31,4 @@ debug_*.png
 
 # mac
 .DS_Store
+logs

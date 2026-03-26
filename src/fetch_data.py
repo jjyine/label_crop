@@ -6,6 +6,7 @@ import requests
 import pymysql
 import cv2
 import numpy as np
+import time
 from io import BytesIO
 from PIL import Image
 from dotenv import load_dotenv
@@ -109,17 +110,48 @@ def select_best_image(image_data):
 
     return None, None
 
+
+def get_fetch_logger():
+    return getattr(_thread_local, "logger", None)
+
+
+def log_fetch(message: str, level: str = "info"):
+    logger = get_fetch_logger()
+    if logger:
+        log_method = getattr(logger, level, logger.info)
+        log_method(message)
+    else:
+        print(message)
+
+
+def create_db_connection():
+    return pymysql.connect(
+        host=db_host,
+        user=db_user,
+        password=db_password,
+        database=db_name,
+        port=3306,
+        connect_timeout=5,
+        read_timeout=30,
+        write_timeout=30,
+    )
+
+
+def close_db_connection(connection):
+    if not connection:
+        return
+
+    try:
+        connection.close()
+    except Exception:
+        pass
+
+
 def fetch_data(limit=1, total_results=None, start_id=400, min_count=None, max_count=None):
     connection = None
+    max_query_retries = 5
+    query_retry_delay = 2
     try:
-        connection = pymysql.connect(
-            host=db_host,
-            user=db_user,
-            password=db_password,
-            database=db_name,
-            port=3306,
-        )
-
         last_id = start_id
         fetched_results = 0
 
@@ -127,123 +159,157 @@ def fetch_data(limit=1, total_results=None, start_id=400, min_count=None, max_co
             if total_results is not None and fetched_results >= total_results:
                 break
 
-            with connection.cursor() as cursor:
-                where_clauses = [
-                    "s3_images IS NOT NULL",
-                    "TRIM(s3_images) != ''",
-                    "vv_ratings_count IS NOT NULL",
-                    """
-                    (
-                        winelabel_crop IS NULL
-                        OR TRIM(winelabel_crop) = ''
+            results = None
+            for attempt in range(1, max_query_retries + 1):
+                try:
+                    if connection is None:
+                        connection = create_db_connection()
+
+                    connection.ping(reconnect=True)
+
+                    with connection.cursor() as cursor:
+                        where_clauses = [
+                            "s3_images IS NOT NULL",
+                            "TRIM(s3_images) != ''",
+                            "vv_ratings_count IS NOT NULL",
+                            """
+                            (
+                                winelabel_crop IS NULL
+                                OR TRIM(winelabel_crop) = ''
+                            )
+                            """,
+                            "id > %s"
+                        ]
+
+                        params = [last_id]
+
+                        if min_count is not None:
+                            where_clauses.append("vv_ratings_count >= %s")
+                            params.append(min_count)
+
+                        if max_count is not None:
+                            where_clauses.append("vv_ratings_count <= %s")
+                            params.append(max_count)
+
+                        where_sql = "\nAND ".join(where_clauses)
+
+                        sql = f"""
+                            SELECT id, s3_images, vv_ratings_count
+                            FROM wine
+                            WHERE {where_sql}
+                            ORDER BY id ASC
+                            LIMIT %s
+                        """
+
+                        params.append(limit)
+
+                        cursor.execute(sql, tuple(params))
+                        results = cursor.fetchall()
+
+                    break
+                except pymysql.MySQLError as e:
+                    close_db_connection(connection)
+                    connection = None
+
+                    log_fetch(
+                        (
+                            f"[FETCH][DB] query attempt {attempt}/{max_query_retries} failed "
+                            f"at last_id={last_id}, range=({min_count}, {max_count}), error={e}"
+                        ),
+                        level="warning",
                     )
-                    """,
-                    "id > %s"
-                ]
 
-                params = [last_id]
+                    if attempt == max_query_retries:
+                        raise RuntimeError(
+                            "fetch_data DB query failed after retries "
+                            f"(last_id={last_id}, range=({min_count}, {max_count}))"
+                        ) from e
 
-                if min_count is not None:
-                    where_clauses.append("vv_ratings_count >= %s")
-                    params.append(min_count)
+                    time.sleep(query_retry_delay * attempt)
 
-                if max_count is not None:
-                    where_clauses.append("vv_ratings_count <= %s")
-                    params.append(max_count)
+            if not results:
+                log_fetch(
+                    f"[FETCH] No more images to fetch. range=({min_count}, {max_count}), last_id={last_id}"
+                )
+                break
 
-                where_sql = "\nAND ".join(where_clauses)
+            for row in results:
+                wine_id = row[0]
+                raw_s3_images = row[1]
+                review_cnt = row[2]
 
-                sql = f"""
-                    SELECT id, s3_images, vv_ratings_count
-                    FROM wine
-                    WHERE {where_sql}
-                    ORDER BY id ASC
-                    LIMIT %s
-                """
+                # 다음 페이지 기준 id 갱신
+                last_id = wine_id
 
-                params.append(limit)
+                # print(f"[INFO] wine.id={wine_id}, review_cnt={review_cnt}, range=({min_count}, {max_count})")
 
-                cursor.execute(sql, tuple(params))
-                results = cursor.fetchall()
+                # 1) s3_images JSON 파싱
+                try:
+                    if not raw_s3_images or not str(raw_s3_images).strip():
+                        # print(f"[SKIP] wine.id={wine_id} - s3_images is empty")
+                        continue
 
-                if not results:
-                    print(f"No more images to fetch. range=({min_count}, {max_count})")
+                    image_data = json.loads(raw_s3_images)
+
+                    if not isinstance(image_data, dict) or not image_data:
+                        # print(f"[SKIP] wine.id={wine_id} - s3_images json is empty or not dict")
+                        continue
+
+                except json.JSONDecodeError as e:
+                    # print(f"[SKIP] wine.id={wine_id} - invalid s3_images json: {e}")
+                    continue
+                except Exception as e:
+                    # print(f"[SKIP] wine.id={wine_id} - failed to parse s3_images: {e}")
+                    continue
+
+                # 2) 사용할 이미지 선택
+                try:
+                    selected_url, selected_key = select_best_image(image_data)
+                    if not selected_url or not selected_key:
+                        # print(f"[SKIP] wine.id={wine_id} - no selectable image found")
+                        continue
+                except Exception as e:
+                    # print(f"[SKIP] wine.id={wine_id} - image selection failed: {e}")
+                    continue
+
+                final_image_url = f"https://vin-social.s3.amazonaws.com/{selected_key}"
+                print("Fetching image from URL:", final_image_url)
+
+                # 3) 이미지 다운로드
+                try:
+                    response = requests.get(final_image_url, timeout=15)
+                    response.raise_for_status()
+                except requests.RequestException as e:
+                    # print(f"[SKIP] wine.id={wine_id} - image download failed: {e}")
+                    continue
+                except Exception as e:
+                    # print(f"[SKIP] wine.id={wine_id} - unexpected download error: {e}")
+                    continue
+
+                # 4) 이미지 열기 / OpenCV 변환
+                try:
+                    img = Image.open(BytesIO(response.content)).convert("RGB")
+                    img_cv = cv2.cvtColor(np.array(img), cv2.COLOR_RGB2BGR)
+                except Exception as e:
+                    # print(f"[SKIP] wine.id={wine_id} - image decode/convert failed: {e}")
+                    continue
+
+                fetched_results += 1
+                yield wine_id, img_cv, final_image_url, selected_url
+
+                if total_results is not None and fetched_results >= total_results:
                     break
 
-                for row in results:
-                    wine_id = row[0]
-                    raw_s3_images = row[1]
-                    review_cnt = row[2]
-
-                    # 다음 페이지 기준 id 갱신
-                    last_id = wine_id
-
-                    # print(f"[INFO] wine.id={wine_id}, review_cnt={review_cnt}, range=({min_count}, {max_count})")
-
-                    # 1) s3_images JSON 파싱
-                    try:
-                        if not raw_s3_images or not str(raw_s3_images).strip():
-                            # print(f"[SKIP] wine.id={wine_id} - s3_images is empty")
-                            continue
-
-                        image_data = json.loads(raw_s3_images)
-
-                        if not isinstance(image_data, dict) or not image_data:
-                            # print(f"[SKIP] wine.id={wine_id} - s3_images json is empty or not dict")
-                            continue
-
-                    except json.JSONDecodeError as e:
-                        # print(f"[SKIP] wine.id={wine_id} - invalid s3_images json: {e}")
-                        continue
-                    except Exception as e:
-                        # print(f"[SKIP] wine.id={wine_id} - failed to parse s3_images: {e}")
-                        continue
-
-                    # 2) 사용할 이미지 선택
-                    try:
-                        selected_url, selected_key = select_best_image(image_data)
-                        if not selected_url or not selected_key:
-                            # print(f"[SKIP] wine.id={wine_id} - no selectable image found")
-                            continue
-                    except Exception as e:
-                        # print(f"[SKIP] wine.id={wine_id} - image selection failed: {e}")
-                        continue
-
-                    final_image_url = f"https://vin-social.s3.amazonaws.com/{selected_key}"
-                    print("Fetching image from URL:", final_image_url)
-
-                    # 3) 이미지 다운로드
-                    try:
-                        response = requests.get(final_image_url, timeout=15)
-                        response.raise_for_status()
-                    except requests.RequestException as e:
-                        # print(f"[SKIP] wine.id={wine_id} - image download failed: {e}")
-                        continue
-                    except Exception as e:
-                        # print(f"[SKIP] wine.id={wine_id} - unexpected download error: {e}")
-                        continue
-
-                    # 4) 이미지 열기 / OpenCV 변환
-                    try:
-                        img = Image.open(BytesIO(response.content)).convert("RGB")
-                        img_cv = cv2.cvtColor(np.array(img), cv2.COLOR_RGB2BGR)
-                    except Exception as e:
-                        # print(f"[SKIP] wine.id={wine_id} - image decode/convert failed: {e}")
-                        continue
-
-                    fetched_results += 1
-                    yield wine_id, img_cv, final_image_url, selected_url
-
-                    if total_results is not None and fetched_results >= total_results:
-                        break
-
+    except RuntimeError:
+        raise
     except pymysql.MySQLError as e:
-        print("DB connect failed:", e)
+        log_fetch(f"[FETCH][DB] unexpected MySQL error: {e}", level="error")
+        raise
     except Exception as e:
-        print("Unexpected fetch_data error:", e)
+        log_fetch(f"[FETCH] unexpected error: {e}", level="error")
+        raise
     finally:
-        if connection:
-            connection.close()
+        close_db_connection(connection)
 
 # -----------------------------
 # 유틸
@@ -642,10 +708,6 @@ def detect_label_edges_gemini_sam(bgr: np.ndarray, url: str):
         "sam_bbox": sam_bbox,
         "sam_mask": sam_mask,
     }
-
-import time
-import pymysql
-
 
 def update_winelabel_crop(wine_id: int, s3_key: str):
     logger = getattr(_thread_local, "logger", None)

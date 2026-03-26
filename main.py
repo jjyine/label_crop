@@ -90,22 +90,37 @@ def worker(worker_name, min_count, max_count, limit):
     fail_count = 0
     fetched_count = 0
 
-    for i, (wine_id, image, data_url, original_url) in enumerate(
-        fetch_data(
-            limit=limit,
-            min_count=min_count,
-            max_count=max_count
+    try:
+        for i, (wine_id, image, data_url, original_url) in enumerate(
+            fetch_data(
+                limit=limit,
+                min_count=min_count,
+                max_count=max_count
+            )
+        ):
+            fetched_count += 1
+            logger.info(f"조회 완료: idx={i + 1}, wine_id={wine_id}, url={data_url}")
+
+            ok = process_one(worker_name, logger, i, wine_id, image, data_url, original_url)
+
+            if ok:
+                success_count += 1
+            else:
+                fail_count += 1
+    except Exception as e:
+        logger.exception(
+            f"조회 루프 실패 - range=({min_count}, {max_count}), fetched={fetched_count}, error={e}"
         )
-    ):
-        fetched_count += 1
-        logger.info(f"조회 완료: idx={i + 1}, wine_id={wine_id}, url={data_url}")
-
-        ok = process_one(worker_name, logger, i, wine_id, image, data_url, original_url)
-
-        if ok:
-            success_count += 1
-        else:
-            fail_count += 1
+        return {
+            "worker": worker_name,
+            "success": success_count,
+            "fail": fail_count,
+            "fetched": fetched_count,
+            "min_count": min_count,
+            "max_count": max_count,
+            "aborted": True,
+            "error": str(e),
+        }
 
     logger.info(
         f"종료 - 조회={fetched_count}, 성공={success_count}, 실패={fail_count}, range=({min_count}, {max_count})"
@@ -118,6 +133,8 @@ def worker(worker_name, min_count, max_count, limit):
         "fetched": fetched_count,
         "min_count": min_count,
         "max_count": max_count,
+        "aborted": False,
+        "error": None,
     }
 
 
@@ -135,6 +152,7 @@ def main():
         total_success = 0
         total_fail = 0
         total_fetched = 0
+        total_aborted = 0
 
         for future in as_completed(futures):
             result = future.result()
@@ -142,15 +160,30 @@ def main():
             total_fail += result["fail"]
             total_fetched += result["fetched"]
 
-            logging.info(
-                f"[완료] {result['worker']} "
-                f"(range={result['min_count']}~{result['max_count']}) "
-                f"조회={result['fetched']}, 성공={result['success']}, 실패={result['fail']}"
-            )
+            if result["aborted"]:
+                total_aborted += 1
+                logging.error(
+                    f"[실패] {result['worker']} "
+                    f"(range={result['min_count']}~{result['max_count']}) "
+                    f"조회={result['fetched']}, 성공={result['success']}, 실패={result['fail']}, "
+                    f"error={result['error']}"
+                )
+            else:
+                logging.info(
+                    f"[완료] {result['worker']} "
+                    f"(range={result['min_count']}~{result['max_count']}) "
+                    f"조회={result['fetched']}, 성공={result['success']}, 실패={result['fail']}"
+                )
 
-        logging.info(
-            f"[전체 완료] 총 조회={total_fetched}, 총 성공={total_success}, 총 실패={total_fail}"
-        )
+        if total_aborted:
+            logging.error(
+                f"[전체 완료] 총 조회={total_fetched}, 총 성공={total_success}, 총 실패={total_fail}, "
+                f"중단 워커={total_aborted}"
+            )
+        else:
+            logging.info(
+                f"[전체 완료] 총 조회={total_fetched}, 총 성공={total_success}, 총 실패={total_fail}"
+            )
 
 
 if __name__ == "__main__":
