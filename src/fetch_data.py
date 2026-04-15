@@ -147,6 +147,17 @@ def close_db_connection(connection):
         pass
 
 
+class FetchRangeError(RuntimeError):
+    def __init__(self, last_id: int, min_count=None, max_count=None):
+        self.last_id = last_id
+        self.min_count = min_count
+        self.max_count = max_count
+        super().__init__(
+            "fetch_data DB query failed after retries "
+            f"(last_id={last_id}, range=({min_count}, {max_count}))"
+        )
+
+
 def fetch_data(limit=1, total_results=None, start_id=400, min_count=None, max_count=None):
     connection = None
     max_query_retries = 5
@@ -220,9 +231,10 @@ def fetch_data(limit=1, total_results=None, start_id=400, min_count=None, max_co
                     )
 
                     if attempt == max_query_retries:
-                        raise RuntimeError(
-                            "fetch_data DB query failed after retries "
-                            f"(last_id={last_id}, range=({min_count}, {max_count}))"
+                        raise FetchRangeError(
+                            last_id=last_id,
+                            min_count=min_count,
+                            max_count=max_count,
                         ) from e
 
                     time.sleep(query_retry_delay * attempt)
@@ -273,6 +285,7 @@ def fetch_data(limit=1, total_results=None, start_id=400, min_count=None, max_co
                     continue
 
                 final_image_url = f"https://vin-social.s3.amazonaws.com/{selected_key}"
+                download_started_at = time.time()
                 print("Fetching image from URL:", final_image_url)
 
                 # 3) 이미지 다운로드
@@ -293,6 +306,8 @@ def fetch_data(limit=1, total_results=None, start_id=400, min_count=None, max_co
                 except Exception as e:
                     # print(f"[SKIP] wine.id={wine_id} - image decode/convert failed: {e}")
                     continue
+
+                log_fetch(f"[TIME] wine_id={wine_id} download={time.time() - download_started_at:.2f}s")
 
                 fetched_results += 1
                 yield wine_id, img_cv, final_image_url, selected_url
@@ -383,7 +398,8 @@ def check_s3_permissions():
             Bucket=S3_BUCKET_NAME,
             Key=test_key,
             Body=b"permission test",
-            ContentType="text/plain"
+            ContentType="text/plain",
+            ACL="public-read",
         )
 
         print(f"[S3] PutObject OK: {test_key}")
@@ -419,6 +435,7 @@ def upload_bytes_to_s3(image_bytes: bytes, s3_key: str, content_type: str = "ima
             Key=s3_key,
             Body=image_bytes,
             ContentType=content_type,
+            ACL="public-read",
         )
         return f"https://{S3_BUCKET_NAME}.s3.{AWS_REGION}.amazonaws.com/{s3_key}"
     except (BotoCoreError, ClientError, Exception) as e:

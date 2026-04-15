@@ -432,12 +432,56 @@ def create_edge_assist_image(bgr: np.ndarray):
     return assist, edges, enhanced
 
 def get_s3_client():
-    return boto3.client(
+    client = getattr(_thread_local, "s3_client", None)
+    if client is not None:
+        return client
+
+    client = boto3.client(
         "s3",
         aws_access_key_id=AWS_ACCESS_KEY_ID,
         aws_secret_access_key=AWS_SECRET_ACCESS_KEY,
         region_name=AWS_REGION,
     )
+    _thread_local.s3_client = client
+    return client
+
+
+def get_db_connection():
+    connection = getattr(_thread_local, "db_connection", None)
+
+    if connection is not None:
+        try:
+            connection.ping(reconnect=True)
+            return connection
+        except Exception:
+            try:
+                connection.close()
+            except Exception:
+                pass
+
+    connection = pymysql.connect(
+        host=db_host,
+        user=db_user,
+        password=db_password,
+        database=db_name,
+        port=3306,
+    )
+    _thread_local.db_connection = connection
+    return connection
+
+
+def reset_thread_local_resources():
+    connection = getattr(_thread_local, "db_connection", None)
+    if connection is not None:
+        try:
+            connection.close()
+        except Exception:
+            pass
+        finally:
+            delattr(_thread_local, "db_connection")
+
+    if hasattr(_thread_local, "s3_client"):
+        delattr(_thread_local, "s3_client")
 
 def check_s3_permissions():
     logger = get_logger()
@@ -449,7 +493,8 @@ def check_s3_permissions():
             Bucket=S3_BUCKET_NAME,
             Key=f"{(S3_LABEL_PREFIX or 'label').strip('/')}/__permission_test__.txt",
             Body=b"permission test",
-            ContentType="text/plain"
+            ContentType="text/plain",
+            ACL="public-read",
         )
 
         if logger:
@@ -483,7 +528,8 @@ def test_s3_upload():
             Bucket=S3_BUCKET_NAME,
             Key=test_key,
             Body=b"test",
-            ContentType="text/plain"
+            ContentType="text/plain",
+            ACL="public-read",
         )
         print(f"[S3] 업로드 테스트 성공: {test_key}")
         return True
@@ -512,6 +558,7 @@ def upload_bytes_to_s3(image_bytes: bytes, s3_key: str, content_type: str = "ima
             Key=s3_key,
             Body=image_bytes,
             ContentType=content_type,
+            ACL="public-read",
         )
         return f"https://{S3_BUCKET_NAME}.s3.{AWS_REGION}.amazonaws.com/{s3_key}"
     except (BotoCoreError, ClientError, Exception) as e:
@@ -523,15 +570,8 @@ def upload_bytes_to_s3(image_bytes: bytes, s3_key: str, content_type: str = "ima
 
 def update_winelabel_crop(wine_id: int, image_url: str):
     logger = get_logger()
-    connection = None
     try:
-        connection = pymysql.connect(
-            host=db_host,
-            user=db_user,
-            password=db_password,
-            database=db_name,
-            port=3306,
-        )
+        connection = get_db_connection()
         with connection.cursor() as cursor:
             sql = "UPDATE wine SET winelabel_crop = %s WHERE id = %s"
             cursor.execute(sql, (image_url, wine_id))
@@ -547,9 +587,6 @@ def update_winelabel_crop(wine_id: int, image_url: str):
             logger.error(f"[DB] update failed: {e}")
         else:
             print(f"[DB] update failed: {e}")
-    finally:
-        if connection:
-            connection.close()
 
 def encode_bgr_to_png_bytes(bgr: np.ndarray) -> bytes:
     ok, buf = cv2.imencode(".png", bgr)
@@ -737,6 +774,7 @@ def crop_labels(wine_id: int, image: np.ndarray, data_url: str, original_url: st
         # )
 
         # 수정 코드: 테스트 시 S3 업로드 막고 mock 성공 처리
+        upload_started_at = time.time()
         if UPLOAD_TO_S3:
             uploaded_s3_url = upload_bytes_to_s3(
                 image_bytes=crop_bytes,
@@ -749,6 +787,8 @@ def crop_labels(wine_id: int, image: np.ndarray, data_url: str, original_url: st
                 logger.info(f"[{out_idx:03d}] S3 upload skipped (UPLOAD_TO_S3=0), mock url={uploaded_s3_url}")
             else:
                 print(f"[{out_idx:03d}] S3 upload skipped (UPLOAD_TO_S3=0), mock url={uploaded_s3_url}")
+        if logger:
+            logger.info(f"[TIME] wine_id={wine_id} s3_upload={time.time() - upload_started_at:.2f}s")
 
         method = "sam" if refined_bbox is not None else "gemini"
 
@@ -765,7 +805,10 @@ def crop_labels(wine_id: int, image: np.ndarray, data_url: str, original_url: st
 
             # 수정 코드: 테스트 시 DB 저장 막기
             if SAVE_TO_DB:
+                db_update_started_at = time.time()
                 update_winelabel_crop(wine_id, json_value)
+                if logger:
+                    logger.info(f"[TIME] wine_id={wine_id} db_update={time.time() - db_update_started_at:.2f}s")
                 if logger:
                     logger.info(f"[{out_idx:03d}] DB updated")
                 else:
